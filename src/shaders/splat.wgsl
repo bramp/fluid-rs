@@ -1,9 +1,14 @@
+// Splat compute shader: injects radial Gaussian impulses of velocity and dye pigment
+// at the cursor position when the user drags the mouse.
+
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var vel_in: texture_2d<f32>;
 @group(0) @binding(2) var vel_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(3) var dye_in: texture_2d<f32>;
 @group(0) @binding(4) var dye_out: texture_storage_2d<rgba16float, write>;
 
+// Evaluates an isotropic 2D Gaussian falloff $\exp(-\|x - c\|^2 / r^2)$,
+// correcting for aspect ratio so the brush remains circular even on non-square grids.
 fn gaussian_splat(uv: vec2<f32>, center: vec2<f32>, radius: f32, aspect: f32) -> f32 {
     var diff = uv - center;
     diff.x *= aspect;
@@ -11,9 +16,11 @@ fn gaussian_splat(uv: vec2<f32>, center: vec2<f32>, radius: f32, aspect: f32) ->
     return exp(-dist_sq / max(radius * radius, 1e-6));
 }
 
+// Dispatched over the simulation grid (`sim_size`, e.g. 512x512).
 @compute @workgroup_size(8, 8, 1)
 fn splat_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
     let dims = vec2<u32>(params.sim_size);
+    // Guard against out-of-bounds threads when grid dimensions are not an exact multiple of 8.
     if id.x >= dims.x || id.y >= dims.y {
         return;
     }
@@ -31,6 +38,7 @@ fn splat_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(vel_out, coords, vel);
 }
 
+// Dispatched over the high-resolution dye grid (`dye_size`, e.g. 1024x1024).
 @compute @workgroup_size(8, 8, 1)
 fn splat_dye(@builtin(global_invocation_id) id: vec3<u32>) {
     let dims = vec2<u32>(params.dye_size);

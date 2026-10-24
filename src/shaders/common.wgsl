@@ -1,4 +1,6 @@
-// Shared uniform buffer and coordinate helpers included across all shaders.
+// Shared uniform buffer and coordinate helpers prepended to all compute and render shaders.
+//
+// Must match the exact field order, types, and 16-byte alignment of `SimParams` in `src/uniforms.rs`.
 
 struct SimParams {
     sim_size: vec2<f32>,
@@ -25,12 +27,13 @@ struct SimParams {
     _padding: u32,
 };
 
-// Converts integer texel coordinates to normalized center UV in [0.0, 1.0].
+// Converts integer texel coordinates `(i, j)` to normalized cell-center UV coordinates in `[0.0, 1.0]`.
+// Adding `0.5` samples the exact geometric center of the grid cell rather than its top-left corner.
 fn texel_to_uv(coords: vec2<i32>, inv_size: vec2<f32>) -> vec2<f32> {
     return (vec2<f32>(coords) + 0.5) * inv_size;
 }
 
-// Clamps integer texel coordinates to valid grid bounds [0, size - 1].
+// Clamps integer texel coordinates to valid grid bounds `[0, size - 1]` for safe `textureLoad` neighbor reads.
 fn clamp_coords(coords: vec2<i32>, size: vec2<f32>) -> vec2<i32> {
     return clamp(coords, vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
 }

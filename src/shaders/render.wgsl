@@ -1,3 +1,8 @@
+// Fullscreen visualization shader.
+//
+// Draws a single oversized triangle covering the entire viewport (`vertex_index` 0, 1, 2)
+// and samples the simulation textures according to `params.display_mode`.
+
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var linear_sampler: sampler;
 @group(0) @binding(2) var dye_tex: texture_2d<f32>;
@@ -8,7 +13,13 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
 };
 
-// Fullscreen procedural triangle covering [-1, 1] clip space without vertex buffers.
+// Procedural fullscreen triangle trick:
+// Instead of uploading a 2-triangle quad (6 vertices) in a vertex buffer, we emit 3 vertices:
+// - index 0 -> clip (-1, -1), uv (0, 1)
+// - index 1 -> clip ( 3, -1), uv (2, 1)
+// - index 2 -> clip (-1,  3), uv (0, -1)
+// The GPU rasterizer clips this single triangle to the [-1, 1] viewport box, avoiding the
+// diagonal seam of a 2-triangle quad and requiring zero vertex buffer allocations.
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     let x = f32(i32(vertex_index & 1u) << 2u) - 1.0;
@@ -21,7 +32,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return out;
 }
 
-// Convert HSV [0..1] to RGB for directional velocity field visualization.
+// Converts HSV (Hue, Saturation, Value in [0, 1]) to RGB for directional velocity visualization.
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
     let k = vec3<f32>(1.0, 2.0 / 3.0, 1.0 / 3.0);
     let p = abs(fract(vec3<f32>(h) + k) * 6.0 - 3.0);
@@ -39,11 +50,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // 0: Dye / Artistic view
         case 0u, default: {
             let bg = vec3<f32>(0.04, 0.035, 0.045);
-            // Smooth tonemapping so bright overlapping splats glow nicely
+            // Exponential tonemapping ($1 - e^{-c}$) prevents bright overlapping splats from clipping harsh white.
             let mapped_dye = vec3<f32>(1.0) - exp(-dye.rgb * 1.4);
             color = bg + mapped_dye;
         }
-        // 1: Velocity debug view (angle -> hue, magnitude -> brightness)
+        // 1: Velocity debug view (direction angle -> hue, speed -> brightness)
         case 1u: {
             let speed = length(vel);
             let angle = atan2(vel.y, vel.x) / (2.0 * 3.14159265) + 0.5;

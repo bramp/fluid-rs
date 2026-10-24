@@ -1,11 +1,26 @@
+//! GPU compute and render pipeline orchestration for the Eulerian fluid solver.
+//!
+//! [`FluidSolver`] owns all GPU textures (`velocity`, `dye`, and later `pressure`, `divergence`,
+//! `curl`, `obstacles`), the uniform parameter buffer, and compiled WGSL pipelines.
+//!
+//! Each frame calls:
+//! 1. [`FluidSolver::step`] to encode compute shader dispatches into a [`wgpu::CommandEncoder`].
+//! 2. [`FluidSolver::render`] to draw the resulting fields onto the window swapchain using a
+//!    single procedural fullscreen triangle.
+
 use std::borrow::Cow;
 use wgpu::util::DeviceExt;
 
 use crate::ping_pong::PingPongTexture;
 use crate::uniforms::SimParams;
 
+/// Shared WGSL header (`SimParams` struct and grid coordinate utilities) prepended to every shader.
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 
+/// Compiles a WGSL shader module by concatenating [`COMMON_WGSL`] with the pass-specific `source`.
+///
+/// Standard WGSL does not have a preprocessor `#include` directive, so prepending `common.wgsl`
+/// ensures every shader uses the exact same `SimParams` struct layout and helper functions.
 fn create_shader_with_common(
     device: &wgpu::Device,
     label: &str,
@@ -18,11 +33,17 @@ fn create_shader_with_common(
     })
 }
 
+/// Manages all GPU simulation textures, uniform buffers, and compute/render pipelines.
 pub struct FluidSolver {
+    /// CPU-side copy of simulation parameters, uploaded to [`Self::params_buffer`] each step.
     pub params: SimParams,
+    /// GPU uniform buffer bound at `@group(0) @binding(0)` across all shaders.
     pub params_buffer: wgpu::Buffer,
+    /// Double-buffered 2D velocity field $(u_x, u_y)$ stored in `Rgba16Float` at simulation resolution.
     pub velocity: PingPongTexture,
+    /// Double-buffered high-resolution pigment/scalar field stored in `Rgba16Float`.
     pub dye: PingPongTexture,
+    /// Hardware bilinear sampler (`FilterMode::Linear`, `AddressMode::ClampToEdge`) for fractional UV lookups.
     pub linear_sampler: wgpu::Sampler,
 
     splat_bind_group_layout: wgpu::BindGroupLayout,
@@ -34,6 +55,14 @@ pub struct FluidSolver {
 }
 
 impl FluidSolver {
+    /// Allocates simulation textures and compiles all compute and render pipelines.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - Logical GPU device used to allocate resources.
+    /// * `surface_format` - Swapchain pixel format targeted by the fullscreen render pipeline.
+    /// * `sim_width` / `sim_height` - Resolution of the physics grid (`velocity`, `pressure`, etc.).
+    /// * `dye_width` / `dye_height` - Resolution of the visual pigment grid (`dye`).
     pub fn new(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
@@ -43,16 +72,25 @@ impl FluidSolver {
         dye_height: u32,
     ) -> Self {
         let params = SimParams::new(sim_width, sim_height, dye_width, dye_height);
+
+        // Allocate the GPU uniform buffer and initialize it with our default SimParams bytes.
+        // COPY_DST allows `queue.write_buffer` to update it every frame without reallocating.
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sim_params_buffer"),
             contents: bytemuck::bytes_of(&params),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Why Rgba16Float?
+        // In WebGPU, 32-bit float textures (`Rgba32Float`) cannot be bilinearly filtered by
+        // hardware samplers unless an optional extension is enabled, whereas 16-bit half-float
+        // (`Rgba16Float`) is universally filterable AND supports compute `STORAGE_BINDING` writes.
         let tex_format = wgpu::TextureFormat::Rgba16Float;
         let velocity = PingPongTexture::new(device, sim_width, sim_height, tex_format, "velocity");
         let dye = PingPongTexture::new(device, dye_width, dye_height, tex_format, "dye");
 
+        // Linear sampler used when sampling between grid cells (e.g. semi-Lagrangian advection
+        // and upsampling simulation textures onto the window viewport).
         let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("linear_clamp_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -64,7 +102,8 @@ impl FluidSolver {
             ..Default::default()
         });
 
-        // Splat Compute Pipeline
+        // --- Splat Compute Pipelines ---
+        // Injects Gaussian velocity impulses and dye pigment where the user drags the mouse.
         let splat_shader =
             create_shader_with_common(device, "splat_shader", include_str!("shaders/splat.wgsl"));
 
@@ -72,6 +111,7 @@ impl FluidSolver {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("splat_bgl"),
                 entries: &[
+                    // @binding(0): Uniform parameters (`SimParams`)
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -82,6 +122,7 @@ impl FluidSolver {
                         },
                         count: None,
                     },
+                    // @binding(1): Read-only input velocity texture
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -92,6 +133,7 @@ impl FluidSolver {
                         },
                         count: None,
                     },
+                    // @binding(2): Write-only output velocity storage texture
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -102,6 +144,7 @@ impl FluidSolver {
                         },
                         count: None,
                     },
+                    // @binding(3): Read-only input dye texture
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -112,6 +155,7 @@ impl FluidSolver {
                         },
                         count: None,
                     },
+                    // @binding(4): Write-only output dye storage texture
                     wgpu::BindGroupLayoutEntry {
                         binding: 4,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -132,6 +176,8 @@ impl FluidSolver {
                 push_constant_ranges: &[],
             });
 
+        // Separate entrypoints because `velocity` (e.g. 512x512) and `dye` (e.g. 1024x1024)
+        // can have different grid resolutions and workgroup dispatch counts.
         let splat_vel_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("splat_vel_pipeline"),
             layout: Some(&splat_pipeline_layout),
@@ -150,7 +196,8 @@ impl FluidSolver {
             cache: None,
         });
 
-        // Fullscreen Render Pipeline
+        // --- Fullscreen Render Pipeline ---
+        // Visualizes either the artistic dye field or debug fields onto the window surface.
         let render_shader =
             create_shader_with_common(device, "render_shader", include_str!("shaders/render.wgsl"));
 
@@ -158,6 +205,7 @@ impl FluidSolver {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("render_bgl"),
                 entries: &[
+                    // @binding(0): Uniform parameters (`SimParams`)
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -168,12 +216,14 @@ impl FluidSolver {
                         },
                         count: None,
                     },
+                    // @binding(1): Bilinear sampler for smooth viewport scaling
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // @binding(2): Current dye texture (`dye.read`)
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -184,6 +234,7 @@ impl FluidSolver {
                         },
                         count: None,
                     },
+                    // @binding(3): Current velocity texture (`velocity.read`)
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -210,6 +261,8 @@ impl FluidSolver {
             vertex: wgpu::VertexState {
                 module: &render_shader,
                 entry_point: Some("vs_main"),
+                // Empty vertex buffers: the vertex shader generates a fullscreen triangle
+                // procedurally from `@builtin(vertex_index)` (indices 0, 1, 2).
                 buffers: &[],
                 compilation_options: Default::default(),
             },
@@ -247,21 +300,31 @@ impl FluidSolver {
         }
     }
 
+    /// Resets all simulation textures (`velocity` and `dye`) to zero.
     pub fn clear(&self, queue: &wgpu::Queue) {
-        // Rgba16Float = 8 bytes per pixel
+        // Rgba16Float has 4 channels * 2 bytes (f16) = 8 bytes per texel.
         self.velocity.clear(queue, 8);
         self.dye.clear(queue, 8);
     }
 
+    /// Advances the fluid simulation by one timestep on the GPU.
+    ///
+    /// Uploads the latest [`Self::params`] to the uniform buffer and records compute shader
+    /// dispatches into `encoder`. No GPU-to-CPU readbacks occur here.
     pub fn step(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
     ) {
+        // Upload the updated uniform struct to the GPU before compute passes run.
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&self.params));
 
+        // Pass 1: Splat / Impulse injection (when the user drags on the canvas).
         if self.params.splat_active != 0 {
+            // Because PingPongTexture::swap() exchanges the read/write texture views after
+            // each pass, creating the BindGroup per-dispatch ensures @binding(1)/@binding(3)
+            // always point to the current `read` texture and @binding(2)/@binding(4) to `write`.
             let splat_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("splat_bg"),
                 layout: &self.splat_bind_group_layout,
@@ -295,6 +358,7 @@ impl FluidSolver {
                     timestamp_writes: None,
                 });
 
+                // Dispatch enough 8x8 workgroups to cover every texel in the velocity grid.
                 cpass.set_pipeline(&self.splat_vel_pipeline);
                 cpass.set_bind_group(0, &splat_bg, &[]);
                 cpass.dispatch_workgroups(
@@ -303,6 +367,7 @@ impl FluidSolver {
                     1,
                 );
 
+                // Dispatch enough 8x8 workgroups to cover every texel in the high-res dye grid.
                 cpass.set_pipeline(&self.splat_dye_pipeline);
                 cpass.set_bind_group(0, &splat_bg, &[]);
                 cpass.dispatch_workgroups(
@@ -312,11 +377,16 @@ impl FluidSolver {
                 );
             }
 
+            // Flip read/write targets so subsequent passes see the newly splatted velocity and dye.
             self.velocity.swap();
             self.dye.swap();
         }
     }
 
+    /// Renders the active simulation field (`dye` or debug view) into `target_view`.
+    ///
+    /// If `viewport` is `Some((x, y, width, height))`, restricts drawing to that sub-rectangle
+    /// of the window (used so the fluid canvas renders cleanly beside the docked `egui` side panel).
     pub fn render(
         &self,
         device: &wgpu::Device,
@@ -376,6 +446,7 @@ impl FluidSolver {
 
         rpass.set_pipeline(&self.render_pipeline);
         rpass.set_bind_group(0, &render_bg, &[]);
+        // Draw 1 triangle with 3 vertices (vertex_index 0..3); no vertex buffer needed!
         rpass.draw(0..3, 0..1);
     }
 }
@@ -384,6 +455,8 @@ impl FluidSolver {
 mod tests {
     use super::*;
 
+    /// Headless GPU test that compiles all WGSL shaders and validates bind group layouts
+    /// against `wgpu`'s Naga shader translator.
     #[test]
     fn verify_wgsl_shaders_compile() {
         let instance = wgpu::Instance::default();
