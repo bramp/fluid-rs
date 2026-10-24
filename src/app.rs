@@ -361,73 +361,44 @@ impl AppState {
     }
 }
 
-/// Top-level [`winit::application::ApplicationHandler`] state machine.
+/// Returns the default [`winit::window::WindowAttributes`] shared by native and web targets.
+fn base_window_attributes() -> winit::window::WindowAttributes {
+    Window::default_attributes()
+        .with_title("fluid-rs — 2D Eulerian Fluid Simulator")
+        .with_inner_size(winit::dpi::LogicalSize::new(1180.0, 860.0))
+}
+
+// ============================================================================
+// Native Desktop ApplicationHandler (macOS / Linux / Windows)
+// ============================================================================
+
+/// Top-level [`winit::application::ApplicationHandler`] for native desktop platforms.
 ///
-/// Because `winit` does not allow creating a [`Window`] before the OS emits `resumed()`,
-/// `state` starts as `None` and is populated once the window and async GPU setup complete.
+/// Because `winit` forbids creating an OS [`Window`] before the event loop emits `resumed()`,
+/// `state` starts as `None` and is initialized synchronously via `pollster::block_on` once
+/// `resumed()` fires.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 pub struct FluidApp {
     state: Option<AppState>,
-    /// On WebAssembly, `GpuContext::new` is initialized asynchronously on the browser microtask
-    /// queue (`spawn_local`) and sent back through this channel once ready.
-    #[cfg(target_arch = "wasm32")]
-    init_receiver: Option<std::sync::mpsc::Receiver<AppState>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ApplicationHandler for FluidApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
         }
 
-        #[allow(unused_mut)]
-        let mut window_attrs = Window::default_attributes()
-            .with_title("fluid-rs — 2D Eulerian Fluid Simulator")
-            .with_inner_size(winit::dpi::LogicalSize::new(1180.0, 860.0));
-
-        // On WebAssembly, attach the winit Window to the `<canvas id="fluid-canvas">` element in index.html.
-        #[cfg(target_arch = "wasm32")]
-        {
-            use wasm_bindgen::JsCast;
-            use winit::platform::web::WindowAttributesExtWebSys;
-            let canvas = web_sys::window()
-                .and_then(|w| w.document())
-                .and_then(|d| d.get_element_by_id("fluid-canvas"))
-                .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok());
-            window_attrs = window_attrs.with_canvas(canvas);
-        }
-
         let window = Arc::new(
             event_loop
-                .create_window(window_attrs)
-                .expect("Failed to create window"),
+                .create_window(base_window_attributes())
+                .expect("Failed to create OS window"),
         );
 
-        // On native desktop, block on the async GPU initialization immediately using `pollster`.
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let state = pollster::block_on(AppState::new(window))
-                .expect("Failed to initialize GPU application state");
-            self.state = Some(state);
-        }
-
-        // On WebAssembly, blocking the main browser thread is forbidden, so spawn the async
-        // initialization as a local Promise task and receive `AppState` on the next window event.
-        #[cfg(target_arch = "wasm32")]
-        {
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.init_receiver = Some(rx);
-            let win_clone = window.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                match AppState::new(win_clone.clone()).await {
-                    Ok(state) => {
-                        let _ = tx.send(state);
-                        win_clone.request_redraw();
-                    }
-                    Err(e) => log::error!("WASM initialization failed: {e:?}"),
-                }
-            });
-        }
+        let state = pollster::block_on(AppState::new(window))
+            .expect("Failed to initialize GPU application state");
+        self.state = Some(state);
     }
 
     fn window_event(
@@ -436,7 +407,70 @@ impl ApplicationHandler for FluidApp {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        #[cfg(target_arch = "wasm32")]
+        if let Some(state) = &mut self.state {
+            state.handle_window_event(event_loop, event);
+        }
+    }
+}
+
+// ============================================================================
+// WebAssembly (Browser WebGPU) ApplicationHandler
+// ============================================================================
+
+/// Top-level [`winit::application::ApplicationHandler`] for WebAssembly (`wasm32`).
+///
+/// Unlike native desktop, browser WebGPU adapter/device requests return JavaScript `Promise`s
+/// and cannot block the main thread. `resumed()` spawns the async initialization task onto the
+/// browser microtask queue and delivers the ready [`AppState`] over `init_receiver`.
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+pub struct FluidApp {
+    state: Option<AppState>,
+    init_receiver: Option<std::sync::mpsc::Receiver<AppState>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl ApplicationHandler for FluidApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        use wasm_bindgen::JsCast;
+        use winit::platform::web::WindowAttributesExtWebSys;
+
+        if self.state.is_some() {
+            return;
+        }
+
+        // Locate `<canvas id="fluid-canvas">` in index.html and attach our winit window to it.
+        let canvas = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("fluid-canvas"))
+            .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok());
+
+        let window_attrs = base_window_attributes().with_canvas(canvas);
+        let window = Arc::new(
+            event_loop
+                .create_window(window_attrs)
+                .expect("Failed to create canvas window"),
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.init_receiver = Some(rx);
+        wasm_bindgen_futures::spawn_local(async move {
+            match AppState::new(window.clone()).await {
+                Ok(state) => {
+                    let _ = tx.send(state);
+                    window.request_redraw();
+                }
+                Err(e) => log::error!("WASM initialization failed: {e:?}"),
+            }
+        });
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
         if self.state.is_none()
             && let Some(rx) = &self.init_receiver
             && let Ok(state) = rx.try_recv()
