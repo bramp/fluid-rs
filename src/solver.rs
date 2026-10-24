@@ -50,6 +50,10 @@ pub struct FluidSolver {
     splat_vel_pipeline: wgpu::ComputePipeline,
     splat_dye_pipeline: wgpu::ComputePipeline,
 
+    advect_bind_group_layout: wgpu::BindGroupLayout,
+    advect_vel_pipeline: wgpu::ComputePipeline,
+    advect_dye_pipeline: wgpu::ComputePipeline,
+
     render_bind_group_layout: wgpu::BindGroupLayout,
     render_pipeline: wgpu::RenderPipeline,
 }
@@ -196,6 +200,97 @@ impl FluidSolver {
             cache: None,
         });
 
+        // --- Semi-Lagrangian Advection Compute Pipelines ---
+        // Transports velocity and dye along the velocity field via backward Euler particle tracing
+        // and hardware bilinear interpolation (`linear_sampler`).
+        let advect_shader =
+            create_shader_with_common(device, "advect_shader", include_str!("shaders/advect.wgsl"));
+
+        let advect_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("advect_bgl"),
+                entries: &[
+                    // @binding(0): Uniform parameters (`SimParams`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // @binding(1): Bilinear sampler for fractional departure point lookups
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // @binding(2): Advecting velocity field (`vel_in`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // @binding(3): Quantity being advected (`source_in`, either velocity or dye)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // @binding(4): Write-only output storage texture (`field_out`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: tex_format,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let advect_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("advect_pipeline_layout"),
+                bind_group_layouts: &[&advect_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let advect_vel_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("advect_vel_pipeline"),
+                layout: Some(&advect_pipeline_layout),
+                module: &advect_shader,
+                entry_point: Some("advect_velocity"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let advect_dye_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("advect_dye_pipeline"),
+                layout: Some(&advect_pipeline_layout),
+                module: &advect_shader,
+                entry_point: Some("advect_dye"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         // --- Fullscreen Render Pipeline ---
         // Visualizes either the artistic dye field or debug fields onto the window surface.
         let render_shader =
@@ -295,6 +390,9 @@ impl FluidSolver {
             splat_bind_group_layout,
             splat_vel_pipeline,
             splat_dye_pipeline,
+            advect_bind_group_layout,
+            advect_vel_pipeline,
+            advect_dye_pipeline,
             render_bind_group_layout,
             render_pipeline,
         }
@@ -381,6 +479,90 @@ impl FluidSolver {
             self.velocity.swap();
             self.dye.swap();
         }
+
+        // Pass 2: Velocity Self-Advection (`velocity.read` advects itself into `velocity.write`).
+        // In WebGPU, binding the same read-only TextureView (`velocity.read`) to two sampled
+        // bindings (@binding(2) and @binding(3)) is valid because neither is a storage write target.
+        let advect_vel_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("advect_vel_bg"),
+            layout: &self.advect_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
+                },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("advect_vel_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.advect_vel_pipeline);
+            cpass.set_bind_group(0, &advect_vel_bg, &[]);
+            cpass.dispatch_workgroups(
+                self.velocity.width.div_ceil(8),
+                self.velocity.height.div_ceil(8),
+                1,
+            );
+        }
+        self.velocity.swap();
+
+        // Pass 3: High-Resolution Dye Advection (`dye.read` advected along `velocity.read` into `dye.write`).
+        let advect_dye_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("advect_dye_bg"),
+            layout: &self.advect_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.dye.read.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&self.dye.write.view),
+                },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("advect_dye_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.advect_dye_pipeline);
+            cpass.set_bind_group(0, &advect_dye_bg, &[]);
+            cpass.dispatch_workgroups(self.dye.width.div_ceil(8), self.dye.height.div_ceil(8), 1);
+        }
+        self.dye.swap();
     }
 
     /// Renders the active simulation field (`dye` or debug view) into `target_view`.
@@ -470,10 +652,20 @@ mod tests {
                 None => return,
             };
 
-        let (device, _queue) =
+        let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
                 .expect("Failed to create test device");
 
-        let _solver = FluidSolver::new(&device, wgpu::TextureFormat::Bgra8Unorm, 64, 64, 128, 128);
+        let mut solver =
+            FluidSolver::new(&device, wgpu::TextureFormat::Bgra8Unorm, 64, 64, 128, 128);
+        solver.clear(&queue);
+
+        // Encode and submit a full simulation step (including splat + advection passes)
+        // to verify there are no wgpu bind group or dispatch validation errors.
+        solver.params.splat_active = 1;
+        solver.params.splat_vel = [50.0, -25.0];
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        solver.step(&device, &queue, &mut encoder);
+        queue.submit(std::iter::once(encoder.finish()));
     }
 }

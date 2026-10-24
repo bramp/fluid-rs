@@ -80,7 +80,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ## Roadmap Progress
 
 - [x] **Milestone 1**: Scaffolding, `wgpu` Context, Fullscreen Triangle & Splat Shader
-- [ ] **Milestone 2**: Semi-Lagrangian Advection (`advect.wgsl`)
+- [x] **Milestone 2**: Semi-Lagrangian Advection (`advect.wgsl`)
 - [ ] **Milestone 3**: Divergence, Jacobi Pressure Solver & Projection (`divergence.wgsl`, `jacobi.wgsl`, `project.wgsl`)
 - [ ] **Milestone 4**: Vorticity Confinement, MacCormack Advection & "Milk in Coffee" Aesthetics
 - [ ] **Milestone 5**: Solid Obstacles & "River with Rocks"

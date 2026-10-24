@@ -99,7 +99,7 @@ impl AppState {
             display_mode: DisplayMode::Dye,
             splat_color: [0.95, 0.72, 0.38],
             splat_radius: 0.025,
-            splat_force: 220.0,
+            splat_force: 15.0,
             mouse_down: false,
             last_mouse_uv: None,
             canvas_rect_px,
@@ -154,9 +154,10 @@ impl AppState {
             WindowEvent::CursorMoved { position, .. } => {
                 if self.mouse_down && !egui_response.consumed {
                     if let Some(uv) = self.cursor_to_canvas_uv(position) {
-                        // Compute cursor movement delta since the last mouse event to inject directional velocity.
+                        // Compute cursor movement delta since the last mouse event and scale by
+                        // `SIM_RES` so velocity is expressed in simulation grid texels per second.
                         let prev = self.last_mouse_uv.unwrap_or(uv);
-                        let delta = (uv - prev) * self.splat_force;
+                        let delta = (uv - prev) * (SIM_RES as f32) * self.splat_force;
                         self.last_mouse_uv = Some(uv);
 
                         self.solver.params.splat_pos = [uv.x, uv.y];
@@ -221,11 +222,25 @@ impl AppState {
                         });
 
                     ui.separator();
+                    ui.label("Advection & Dissipation");
+                    ui.add(
+                        egui::Slider::new(&mut self.solver.params.dt, 0.001..=0.05)
+                            .text("Timestep (dt)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.solver.params.velocity_dissipation, 0.95..=1.0)
+                            .text("Vel Dissipation"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.solver.params.dye_dissipation, 0.95..=1.0)
+                            .text("Dye Dissipation"),
+                    );
+
+                    ui.separator();
                     ui.label("Brush / Splat");
                     ui.add(egui::Slider::new(&mut self.splat_radius, 0.005..=0.08).text("Radius"));
                     ui.add(
-                        egui::Slider::new(&mut self.splat_force, 20.0..=600.0)
-                            .text("Impulse Force"),
+                        egui::Slider::new(&mut self.splat_force, 1.0..=50.0).text("Impulse Force"),
                     );
                     ui.horizontal(|ui| {
                         ui.label("Dye Color");

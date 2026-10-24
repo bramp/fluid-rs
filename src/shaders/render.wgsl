@@ -58,7 +58,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         case 1u: {
             let speed = length(vel);
             let angle = atan2(vel.y, vel.x) / (2.0 * 3.14159265) + 0.5;
-            let mag = clamp(speed * 0.02, 0.0, 1.0);
+            let mag = clamp(speed * 0.004, 0.0, 1.0);
             color = hsv_to_rgb(angle, 0.85, mag);
         }
     }
