@@ -40,8 +40,8 @@ fn advect_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
     // Trace backward in time: convert velocity from sim-texels/sec to UV/sec via `inv_sim_size`.
     let prev_uv = uv - params.dt * vel * params.inv_sim_size;
 
-    // Bilinearly sample the velocity field at the departure point and apply per-step damping.
-    let advected = textureSampleLevel(source_in, linear_sampler, prev_uv, 0.0).xy;
+    // Interpolate the velocity field at the departure point in full f32 precision and apply damping.
+    let advected = bilerp(source_in, prev_uv, params.sim_size).xy;
     let damped = advected * params.velocity_dissipation;
 
     textureStore(field_out, coords, vec4<f32>(damped, 0.0, 1.0));
@@ -59,14 +59,14 @@ fn advect_dye(@builtin(global_invocation_id) id: vec3<u32>) {
     let coords = vec2<i32>(id.xy);
     let uv = texel_to_uv(coords, params.inv_dye_size);
 
-    // Sample velocity bilinearly because the dye grid (1024^2) is finer than the sim grid (512^2).
-    let vel = textureSampleLevel(vel_in, linear_sampler, uv, 0.0).xy;
+    // Sample velocity in f32 because the dye grid (1024^2) is finer than the sim grid (512^2).
+    let vel = bilerp(vel_in, uv, params.sim_size).xy;
 
     // Trace backward in UV space using `inv_sim_size` (since `vel` is in sim-grid texels/sec).
     let prev_uv = uv - params.dt * vel * params.inv_sim_size;
 
-    // Bilinearly sample the dye concentration at the departure point and apply fade dissipation.
-    let advected = textureSampleLevel(source_in, linear_sampler, prev_uv, 0.0);
+    // Interpolate the dye concentration at the departure point in full f32 precision and apply fade.
+    let advected = bilerp(source_in, prev_uv, params.dye_size);
     let dissipated = advected * params.dye_dissipation;
 
     textureStore(field_out, coords, dissipated);

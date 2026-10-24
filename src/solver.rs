@@ -11,8 +11,8 @@
 use std::borrow::Cow;
 use wgpu::util::DeviceExt;
 
-use crate::ping_pong::PingPongTexture;
-use crate::uniforms::SimParams;
+use crate::ping_pong::{GpuTexture, PingPongTexture};
+use crate::uniforms::{DisplayMode, SimParams};
 
 /// Shared WGSL header (`SimParams` struct and grid coordinate utilities) prepended to every shader.
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
@@ -43,8 +43,18 @@ pub struct FluidSolver {
     pub velocity: PingPongTexture,
     /// Double-buffered high-resolution pigment/scalar field stored in `Rgba16Float`.
     pub dye: PingPongTexture,
+    /// Double-buffered scalar pressure field $p$ stored in `Rgba16Float` at simulation resolution.
+    pub pressure: PingPongTexture,
+    /// Single-buffered scalar velocity divergence $\nabla \cdot \mathbf{u}$ stored in `Rgba16Float`.
+    pub divergence: GpuTexture,
     /// Hardware bilinear sampler (`FilterMode::Linear`, `AddressMode::ClampToEdge`) for fractional UV lookups.
     pub linear_sampler: wgpu::Sampler,
+
+    /// Number of Jacobi Poisson relaxations per frame (typically `30..=50`).
+    pub jacobi_iterations: u32,
+    /// When `true`, reuses the previous frame's pressure field as the initial guess for Jacobi
+    /// iteration ("warm starting"), accelerating convergence for smoothly varying flows.
+    pub warm_start_pressure: bool,
 
     splat_bind_group_layout: wgpu::BindGroupLayout,
     splat_vel_pipeline: wgpu::ComputePipeline,
@@ -53,6 +63,13 @@ pub struct FluidSolver {
     advect_bind_group_layout: wgpu::BindGroupLayout,
     advect_vel_pipeline: wgpu::ComputePipeline,
     advect_dye_pipeline: wgpu::ComputePipeline,
+
+    divergence_bind_group_layout: wgpu::BindGroupLayout,
+    divergence_pipeline: wgpu::ComputePipeline,
+
+    pressure_project_bind_group_layout: wgpu::BindGroupLayout,
+    jacobi_pipeline: wgpu::ComputePipeline,
+    project_pipeline: wgpu::ComputePipeline,
 
     render_bind_group_layout: wgpu::BindGroupLayout,
     render_pipeline: wgpu::RenderPipeline,
@@ -92,6 +109,8 @@ impl FluidSolver {
         let tex_format = wgpu::TextureFormat::Rgba16Float;
         let velocity = PingPongTexture::new(device, sim_width, sim_height, tex_format, "velocity");
         let dye = PingPongTexture::new(device, dye_width, dye_height, tex_format, "dye");
+        let pressure = PingPongTexture::new(device, sim_width, sim_height, tex_format, "pressure");
+        let divergence = GpuTexture::new(device, sim_width, sim_height, tex_format, "divergence");
 
         // Linear sampler used when sampling between grid cells (e.g. semi-Lagrangian advection
         // and upsampling simulation textures onto the window viewport).
@@ -291,6 +310,159 @@ impl FluidSolver {
                 cache: None,
             });
 
+        // --- Divergence Compute Pipeline ---
+        // Computes $\nabla \cdot \mathbf{u}^*$ from `velocity.read` into `divergence`.
+        let divergence_shader = create_shader_with_common(
+            device,
+            "divergence_shader",
+            include_str!("shaders/divergence.wgsl"),
+        );
+
+        let divergence_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("divergence_bgl"),
+                entries: &[
+                    // @binding(0): Uniform parameters (`SimParams`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // @binding(1): Input velocity texture (`vel_in`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // @binding(2): Output divergence storage texture (`div_out`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: tex_format,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let divergence_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("divergence_pipeline_layout"),
+                bind_group_layouts: &[&divergence_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let divergence_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("divergence_pipeline"),
+                layout: Some(&divergence_pipeline_layout),
+                module: &divergence_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // --- Jacobi Pressure Solver & Pressure Projection Pipelines ---
+        // Both `jacobi.wgsl` and `project.wgsl` take `SimParams` (@binding(0)), two sampled
+        // input textures (@binding(1), @binding(2)), and one storage output texture (@binding(3)),
+        // so they share `pressure_project_bind_group_layout`.
+        let jacobi_shader =
+            create_shader_with_common(device, "jacobi_shader", include_str!("shaders/jacobi.wgsl"));
+        let project_shader = create_shader_with_common(
+            device,
+            "project_shader",
+            include_str!("shaders/project.wgsl"),
+        );
+
+        let pressure_project_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("pressure_project_bgl"),
+                entries: &[
+                    // @binding(0): Uniform parameters (`SimParams`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // @binding(1): First input texture (`pressure_in` for Jacobi, `vel_in` for Project)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // @binding(2): Second input texture (`div_in` for Jacobi, `pressure_in` for Project)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // @binding(3): Storage output texture (`pressure_out` for Jacobi, `vel_out` for Project)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: tex_format,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let pressure_project_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("pressure_project_pipeline_layout"),
+                bind_group_layouts: &[&pressure_project_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let jacobi_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("jacobi_pipeline"),
+            layout: Some(&pressure_project_pipeline_layout),
+            module: &jacobi_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let project_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("project_pipeline"),
+            layout: Some(&pressure_project_pipeline_layout),
+            module: &project_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         // --- Fullscreen Render Pipeline ---
         // Visualizes either the artistic dye field or debug fields onto the window surface.
         let render_shader =
@@ -332,6 +504,28 @@ impl FluidSolver {
                     // @binding(3): Current velocity texture (`velocity.read`)
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // @binding(4): Current pressure texture (`pressure.read`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // @binding(5): Velocity divergence texture (`divergence`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -386,23 +580,34 @@ impl FluidSolver {
             params_buffer,
             velocity,
             dye,
+            pressure,
+            divergence,
             linear_sampler,
+            jacobi_iterations: 35,
+            warm_start_pressure: true,
             splat_bind_group_layout,
             splat_vel_pipeline,
             splat_dye_pipeline,
             advect_bind_group_layout,
             advect_vel_pipeline,
             advect_dye_pipeline,
+            divergence_bind_group_layout,
+            divergence_pipeline,
+            pressure_project_bind_group_layout,
+            jacobi_pipeline,
+            project_pipeline,
             render_bind_group_layout,
             render_pipeline,
         }
     }
 
-    /// Resets all simulation textures (`velocity` and `dye`) to zero.
+    /// Resets all simulation textures (`velocity`, `dye`, `pressure`, and `divergence`) to zero.
     pub fn clear(&self, queue: &wgpu::Queue) {
         // Rgba16Float has 4 channels * 2 bytes (f16) = 8 bytes per texel.
         self.velocity.clear(queue, 8);
         self.dye.clear(queue, 8);
+        self.pressure.clear(queue, 8);
+        self.divergence.clear(queue, 8);
     }
 
     /// Advances the fluid simulation by one timestep on the GPU.
@@ -525,7 +730,98 @@ impl FluidSolver {
         }
         self.velocity.swap();
 
-        // Pass 3: High-Resolution Dye Advection (`dye.read` advected along `velocity.read` into `dye.write`).
+        // Pass 3: Velocity Divergence ($\nabla \cdot \mathbf{u}^*$).
+        self.dispatch_divergence(device, encoder, "divergence_pre_project_pass");
+
+        // Pass 4: Iterative Jacobi Poisson Pressure Solver ($\nabla^2 p = \nabla \cdot \mathbf{u}^*$).
+        // When `warm_start_pressure` is false, zero `pressure.read` before starting the relaxation
+        // loop so the user can compare cold-start vs. warm-start convergence in real time.
+        if !self.warm_start_pressure {
+            self.pressure.read.clear(queue, 8);
+        }
+
+        let sim_wg_x = self.velocity.width.div_ceil(8);
+        let sim_wg_y = self.velocity.height.div_ceil(8);
+
+        for _ in 0..self.jacobi_iterations {
+            let jacobi_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("jacobi_bg"),
+                layout: &self.pressure_project_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.pressure.read.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.divergence.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.pressure.write.view),
+                    },
+                ],
+            });
+
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("jacobi_pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.jacobi_pipeline);
+                cpass.set_bind_group(0, &jacobi_bg, &[]);
+                cpass.dispatch_workgroups(sim_wg_x, sim_wg_y, 1);
+            }
+            self.pressure.swap();
+        }
+
+        // Pass 5: Pressure Gradient Subtraction ($\mathbf{u}^{n+1} = \mathbf{u}^* - \nabla p$).
+        let project_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("project_bg"),
+            layout: &self.pressure_project_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.pressure.read.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
+                },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("project_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.project_pipeline);
+            cpass.set_bind_group(0, &project_bg, &[]);
+            cpass.dispatch_workgroups(sim_wg_x, sim_wg_y, 1);
+        }
+        self.velocity.swap();
+
+        // When the user selects the `Divergence` debug view, recompute $\nabla \cdot \mathbf{u}^{n+1}$
+        // after projection so they can verify that incompressibility holds (nearly black at 35
+        // Jacobi iterations, lighting up if iterations are reduced toward 0).
+        if self.params.display_mode == DisplayMode::Divergence as u32 {
+            self.dispatch_divergence(device, encoder, "divergence_post_project_pass");
+        }
+
+        // Pass 6: High-Resolution Dye Advection (`dye.read` advected along divergence-free `velocity.read`).
         let advect_dye_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("advect_dye_bg"),
             layout: &self.advect_bind_group_layout,
@@ -565,6 +861,46 @@ impl FluidSolver {
         self.dye.swap();
     }
 
+    /// Helper that dispatches `divergence_pipeline` to compute $\nabla \cdot \mathbf{u}$ from
+    /// `self.velocity.read` into `self.divergence`.
+    fn dispatch_divergence(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        pass_label: &str,
+    ) {
+        let div_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("divergence_bg"),
+            layout: &self.divergence_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.divergence.view),
+                },
+            ],
+        });
+
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(pass_label),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.divergence_pipeline);
+        cpass.set_bind_group(0, &div_bg, &[]);
+        cpass.dispatch_workgroups(
+            self.velocity.width.div_ceil(8),
+            self.velocity.height.div_ceil(8),
+            1,
+        );
+    }
+
     /// Renders the active simulation field (`dye` or debug view) into `target_view`.
     ///
     /// If `viewport` is `Some((x, y, width, height))`, restricts drawing to that sub-rectangle
@@ -595,6 +931,14 @@ impl FluidSolver {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&self.pressure.read.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&self.divergence.view),
                 },
             ],
         });

@@ -18,17 +18,23 @@ pub enum DisplayMode {
     Dye = 0,
     /// Visualizes the 2D velocity vector field using an HSV color wheel (angle = hue, speed = brightness).
     Velocity = 1,
+    /// Visualizes the scalar pressure field $p$ using a diverging red (+) / blue (-) heatmap.
+    Pressure = 2,
+    /// Visualizes the post-projection velocity divergence $\nabla \cdot \mathbf{u}$ using a red/blue heatmap.
+    Divergence = 3,
 }
 
 impl DisplayMode {
     /// All available display modes for populating UI dropdowns.
-    pub const ALL: [Self; 2] = [Self::Dye, Self::Velocity];
+    pub const ALL: [Self; 4] = [Self::Dye, Self::Velocity, Self::Pressure, Self::Divergence];
 
     /// Returns a human-readable label for the `egui` combo box.
     pub fn label(self) -> &'static str {
         match self {
             Self::Dye => "Dye (Artistic)",
             Self::Velocity => "Velocity (HSV)",
+            Self::Pressure => "Pressure (Heatmap)",
+            Self::Divergence => "Divergence (Post-Projection)",
         }
     }
 }

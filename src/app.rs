@@ -237,6 +237,14 @@ impl AppState {
                     );
 
                     ui.separator();
+                    ui.label("Pressure Solver (Incompressibility)");
+                    ui.add(
+                        egui::Slider::new(&mut self.solver.jacobi_iterations, 0..=80)
+                            .text("Jacobi Iterations"),
+                    );
+                    ui.checkbox(&mut self.solver.warm_start_pressure, "Warm-Start Pressure");
+
+                    ui.separator();
                     ui.label("Brush / Splat");
                     ui.add(egui::Slider::new(&mut self.splat_radius, 0.005..=0.08).text("Radius"));
                     ui.add(

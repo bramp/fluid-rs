@@ -7,6 +7,8 @@
 @group(0) @binding(1) var linear_sampler: sampler;
 @group(0) @binding(2) var dye_tex: texture_2d<f32>;
 @group(0) @binding(3) var vel_tex: texture_2d<f32>;
+@group(0) @binding(4) var pressure_tex: texture_2d<f32>;
+@group(0) @binding(5) var div_tex: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -39,10 +41,24 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
     return v * mix(vec3<f32>(1.0), clamp(p - 1.0, vec3<f32>(0.0), vec3<f32>(1.0)), s);
 }
 
+// Maps a signed scalar value `val` to a diverging heatmap:
+// positive -> warm orange/red, zero -> dark neutral gray, negative -> cool cyan/blue.
+fn signed_heatmap(val: f32) -> vec3<f32> {
+    let t = clamp(val, -1.0, 1.0);
+    let pos = max(t, 0.0);
+    let neg = max(-t, 0.0);
+    let base = vec3<f32>(0.05, 0.05, 0.07);
+    let warm = vec3<f32>(0.95, 0.30, 0.12) * pos + vec3<f32>(0.3, 0.5, 0.0) * (pos * pos);
+    let cool = vec3<f32>(0.10, 0.45, 0.95) * neg + vec3<f32>(0.0, 0.3, 0.3) * (neg * neg);
+    return base + warm + cool;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dye = textureSampleLevel(dye_tex, linear_sampler, in.uv, 0.0);
     let vel = textureSampleLevel(vel_tex, linear_sampler, in.uv, 0.0).xy;
+    let pressure = textureSampleLevel(pressure_tex, linear_sampler, in.uv, 0.0).x;
+    let div = textureSampleLevel(div_tex, linear_sampler, in.uv, 0.0).x;
 
     var color = vec3<f32>(0.0);
 
@@ -60,6 +76,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let angle = atan2(vel.y, vel.x) / (2.0 * 3.14159265) + 0.5;
             let mag = clamp(speed * 0.004, 0.0, 1.0);
             color = hsv_to_rgb(angle, 0.85, mag);
+        }
+        // 2: Pressure field heatmap (red = high pressure ahead of stroke, blue = low pressure wake)
+        case 2u: {
+            color = signed_heatmap(pressure * 0.015);
+        }
+        // 3: Velocity divergence heatmap ($\nabla \cdot \mathbf{u}^*$)
+        case 3u: {
+            color = signed_heatmap(div * 0.08);
         }
     }
 

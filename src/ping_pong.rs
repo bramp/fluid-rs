@@ -12,12 +12,16 @@
 //! [`PingPongTexture::swap`] on the CPU (an $O(1)$ pointer swap) so `write` becomes `read`
 //! for the next pass.
 
-/// A single 2D GPU texture paired with its default [`wgpu::TextureView`].
+/// A single 2D GPU texture paired with its default [`wgpu::TextureView`] and dimensions.
 pub struct GpuTexture {
     /// Underlying GPU texture allocation.
     pub texture: wgpu::Texture,
     /// View handle used when binding this texture to a [`wgpu::BindGroup`].
     pub view: wgpu::TextureView,
+    /// Grid width in texels.
+    pub width: u32,
+    /// Grid height in texels.
+    pub height: u32,
 }
 
 impl GpuTexture {
@@ -50,7 +54,39 @@ impl GpuTexture {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Self { texture, view }
+        Self {
+            texture,
+            view,
+            width,
+            height,
+        }
+    }
+
+    /// Zeroes out this texture on the GPU using `queue.write_texture`.
+    ///
+    /// Uses `write_texture` rather than `CommandEncoder::clear_texture` because `clear_texture`
+    /// requires an optional native-only `CLEAR_TEXTURE` wgpu feature that is not supported on WebGPU.
+    pub fn clear(&self, queue: &wgpu::Queue, bytes_per_pixel: u32) {
+        let zero_data = vec![0u8; (self.width * self.height * bytes_per_pixel) as usize];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &zero_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.width * bytes_per_pixel),
+                rows_per_image: Some(self.height),
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 }
 
@@ -93,32 +129,9 @@ impl PingPongTexture {
         std::mem::swap(&mut self.read, &mut self.write);
     }
 
-    /// Zeroes out both the `read` and `write` textures on the GPU using `queue.write_texture`.
-    ///
-    /// Uses `write_texture` rather than `CommandEncoder::clear_texture` because `clear_texture`
-    /// requires an optional native-only `CLEAR_TEXTURE` wgpu feature that is not supported on WebGPU.
+    /// Zeroes out both the `read` and `write` textures on the GPU.
     pub fn clear(&self, queue: &wgpu::Queue, bytes_per_pixel: u32) {
-        let zero_data = vec![0u8; (self.width * self.height * bytes_per_pixel) as usize];
-        for tex in [&self.read.texture, &self.write.texture] {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &zero_data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(self.width * bytes_per_pixel),
-                    rows_per_image: Some(self.height),
-                },
-                wgpu::Extent3d {
-                    width: self.width,
-                    height: self.height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+        self.read.clear(queue, bytes_per_pixel);
+        self.write.clear(queue, bytes_per_pixel);
     }
 }
