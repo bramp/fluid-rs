@@ -207,6 +207,7 @@ impl AppState {
 
         let mut clear_requested = false;
         let mut step_once_requested = false;
+        let mut requested_dye_res: Option<u32> = None;
         let raw_input = self.egui_state.take_egui_input(&self.gpu.window);
 
         // Run the immediate-mode UI pass to collect widget state changes and tessellated UI geometry.
@@ -239,8 +240,16 @@ impl AppState {
                         );
 
                     ui.checkbox(
+                        &mut self.solver.enable_vorticity_confinement,
+                        "1. Vorticity Confinement",
+                    )
+                    .on_hover_text(
+                        "Computes curl ω = ∇ × u and injects a tangential booster force f_vort = ε(N × ω) to restore fine turbulent swirls lost to grid dissipation.",
+                    );
+
+                    ui.checkbox(
                         &mut self.solver.enable_velocity_advection,
-                        "1. Velocity Self-Advection",
+                        "2. Velocity Self-Advection",
                     )
                     .on_hover_text(
                         "Solves ∂u/∂t + (u · ∇)u = 0 so momentum carries itself across the grid. If disabled, velocity stays frozen at the spot where you clicked.",
@@ -248,7 +257,7 @@ impl AppState {
 
                     ui.checkbox(
                         &mut self.solver.enable_pressure_projection,
-                        "2. Pressure Projection (∇·u = 0)",
+                        "3. Pressure Projection (∇·u = 0)",
                     )
                     .on_hover_text(
                         "Solves the Poisson equation ∇²p = ∇·u* and subtracts ∇p to make the fluid incompressible. Disable this to see Milestone 2's compressible Burgers shockwaves!",
@@ -256,10 +265,18 @@ impl AppState {
 
                     ui.checkbox(
                         &mut self.solver.enable_dye_advection,
-                        "3. High-Res Dye Advection",
+                        "4. High-Res Dye Advection",
                     )
                     .on_hover_text(
-                        "Transports the 1024×1024 dye pigment along the 512×512 velocity field. If disabled, you can paint dye and move velocity, but the dye won't flow.",
+                        "Transports the high-resolution dye pigment along the 512×512 velocity field. If disabled, you can paint dye and move velocity, but the dye won't flow.",
+                    );
+
+                    ui.checkbox(
+                        &mut self.solver.enable_maccormack_advection,
+                        "MacCormack Advection (2nd-Order)",
+                    )
+                    .on_hover_text(
+                        "Traces forward and backward in time (φ_new = φ_hat + 0.5*(φ - φ_back)) and clamps to the 4 nearest source texels. Uncheck to revert to 1st-order Semi-Lagrangian and watch fine cream ribbons blur faster!",
                     );
 
                     ui.checkbox(&mut self.use_f32_bilerp, "f32 Software Bilerp")
@@ -268,13 +285,21 @@ impl AppState {
                         );
 
                     ui.separator();
-                    ui.label("Advection & Dissipation");
+                    ui.label("Advection, Vorticity & Dissipation");
                     ui.add(
                         egui::Slider::new(&mut self.solver.params.dt, 0.001..=0.05)
                             .text("Timestep (dt)"),
                     )
                     .on_hover_text(
-                        "Simulation timestep Δt in seconds per frame. Larger values make the fluid move faster per frame; Semi-Lagrangian backward tracing stays stable even at high Δt.",
+                        "Simulation timestep Δt in seconds per frame. Larger values make the fluid move faster per frame.",
+                    );
+                    ui.add_enabled(
+                        self.solver.enable_vorticity_confinement,
+                        egui::Slider::new(&mut self.solver.params.vorticity_strength, 0.0..=50.0)
+                            .text("Vorticity (ε)"),
+                    )
+                    .on_hover_text(
+                        "Vorticity confinement scale ε. Higher values inject stronger rotational forces around vortex cores, creating intricate fractal curls.",
                     );
                     ui.add(
                         egui::Slider::new(&mut self.solver.params.velocity_dissipation, 0.95..=1.0)
@@ -361,8 +386,25 @@ impl AppState {
                     });
 
                     ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Dye Grid")
+                            .on_hover_text("Decoupled resolution of the visual dye texture (while physics stays fast at 512×512).");
+                        let current_dye = self.solver.dye.width;
+                        for res in [512u32, 1024, 2048] {
+                            if ui
+                                .selectable_label(current_dye == res, format!("{res}²"))
+                                .on_hover_text(format!(
+                                    "Switch dye texture resolution to {res}×{res} while keeping velocity/pressure at 512×512."
+                                ))
+                                .clicked()
+                                && current_dye != res
+                            {
+                                requested_dye_res = Some(res);
+                            }
+                        }
+                    });
                     ui.small(format!(
-                        "Sim Grid: {}×{}\nDye Grid: {}×{}",
+                        "Sim Grid: {}×{} | Dye Grid: {}×{}",
                         self.solver.velocity.width,
                         self.solver.velocity.height,
                         self.solver.dye.width,
@@ -383,6 +425,11 @@ impl AppState {
 
         self.egui_state
             .handle_platform_output(&self.gpu.window, full_output.platform_output);
+
+        if let Some(new_res) = requested_dye_res {
+            self.solver
+                .resize_dye_grid(&self.gpu.device, &self.gpu.queue, new_res, new_res);
+        }
 
         if clear_requested {
             self.solver.clear(&self.gpu.queue);

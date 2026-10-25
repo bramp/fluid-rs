@@ -9,6 +9,7 @@
 @group(0) @binding(3) var vel_tex: texture_2d<f32>;
 @group(0) @binding(4) var pressure_tex: texture_2d<f32>;
 @group(0) @binding(5) var div_tex: texture_2d<f32>;
+@group(0) @binding(6) var curl_tex: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -53,22 +54,73 @@ fn signed_heatmap(val: f32) -> vec3<f32> {
     return base + warm + cool;
 }
 
+// Physically inspired "Milk in Coffee" color ramp and surface shading.
+//
+// Models subsurface light scattering and Beer-Lambert exponential absorption when cream/milk
+// concentration $m \ge 0$ swirls through dark roasted espresso:
+// - $m \approx 0$: Deep espresso base (`espresso_dark`)
+// - $0 < m < 0.5$: Translucent warm golden-brown caramel (`caramel_mid`) where thin milk
+//   ribbons scatter warm wavelengths before being absorbed by the dark coffee
+// - $m > 0.5$: Opaque steamed cream (`cream_white`)
+// Finally, computes the spatial gradient $\nabla m$ across neighboring high-res dye texels to
+// add a subtle directional rim highlight along the curling ribbon edges.
+fn shade_milk_in_coffee(uv: vec2<f32>, dye: vec4<f32>) -> vec3<f32> {
+    let m = max(dye.r, max(dye.g, dye.b));
+
+    let espresso_dark = vec3<f32>(0.045, 0.022, 0.012);
+    let caramel_mid   = vec3<f32>(0.56, 0.29, 0.11);
+    let cream_white   = vec3<f32>(0.97, 0.93, 0.85);
+
+    // Two-stage Beer-Lambert transmittance curve ($1 - e^{-k m}$):
+    // Thin milk edges quickly warm into caramel, while denser cores saturate into cream.
+    let t_caramel = 1.0 - exp(-m * 2.4);
+    let t_cream   = 1.0 - exp(-max(m - 0.14, 0.0) * 1.65);
+
+    var color = mix(espresso_dark, caramel_mid, t_caramel);
+    color = mix(color, cream_white, t_cream * t_cream);
+
+    // Estimate concentration gradient $\nabla m$ for subtle 3D liquid rim lighting.
+    let dx = vec2<f32>(params.inv_dye_size.x, 0.0);
+    let dy = vec2<f32>(0.0, params.inv_dye_size.y);
+    let m_right = max(
+        textureSampleLevel(dye_tex, linear_sampler, uv + dx, 0.0).r,
+        textureSampleLevel(dye_tex, linear_sampler, uv + dx, 0.0).g,
+    );
+    let m_left = max(
+        textureSampleLevel(dye_tex, linear_sampler, uv - dx, 0.0).r,
+        textureSampleLevel(dye_tex, linear_sampler, uv - dx, 0.0).g,
+    );
+    let m_top = max(
+        textureSampleLevel(dye_tex, linear_sampler, uv + dy, 0.0).r,
+        textureSampleLevel(dye_tex, linear_sampler, uv + dy, 0.0).g,
+    );
+    let m_bot = max(
+        textureSampleLevel(dye_tex, linear_sampler, uv - dy, 0.0).r,
+        textureSampleLevel(dye_tex, linear_sampler, uv - dy, 0.0).g,
+    );
+
+    let grad_m = vec2<f32>(m_right - m_left, m_top - m_bot);
+    let normal = normalize(vec3<f32>(-grad_m * 3.5, 1.0));
+    let light_dir = normalize(vec3<f32>(-0.45, -0.6, 0.66));
+    let rim_spec = pow(max(dot(normal, light_dir), 0.0), 12.0) * clamp(length(grad_m) * 2.5, 0.0, 1.0);
+
+    return color + vec3<f32>(0.18, 0.14, 0.10) * rim_spec;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dye = textureSampleLevel(dye_tex, linear_sampler, in.uv, 0.0);
     let vel = textureSampleLevel(vel_tex, linear_sampler, in.uv, 0.0).xy;
     let pressure = textureSampleLevel(pressure_tex, linear_sampler, in.uv, 0.0).x;
     let div = textureSampleLevel(div_tex, linear_sampler, in.uv, 0.0).x;
+    let curl = textureSampleLevel(curl_tex, linear_sampler, in.uv, 0.0).x;
 
     var color = vec3<f32>(0.0);
 
     switch params.display_mode {
-        // 0: Dye / Artistic view
+        // 0: Milk in Coffee (Artistic Beer-Lambert color ramp + specular rim lighting)
         case 0u, default: {
-            let bg = vec3<f32>(0.04, 0.035, 0.045);
-            // Exponential tonemapping ($1 - e^{-c}$) prevents bright overlapping splats from clipping harsh white.
-            let mapped_dye = vec3<f32>(1.0) - exp(-dye.rgb * 1.4);
-            color = bg + mapped_dye;
+            color = shade_milk_in_coffee(in.uv, dye);
         }
         // 1: Velocity debug view (direction angle -> hue, speed -> brightness)
         case 1u: {
@@ -81,9 +133,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         case 2u: {
             color = signed_heatmap(pressure * 0.015);
         }
-        // 3: Velocity divergence heatmap ($\nabla \cdot \mathbf{u}^*$)
+        // 3: Velocity divergence heatmap ($\nabla \cdot \mathbf{u}$)
         case 3u: {
             color = signed_heatmap(div * 0.08);
+        }
+        // 4: Curl / Vorticity heatmap ($\omega = \nabla \times \mathbf{u}$)
+        case 4u: {
+            color = signed_heatmap(curl * 0.06);
+        }
+        // 5: Raw RGB Dye view
+        case 5u: {
+            let bg = vec3<f32>(0.04, 0.035, 0.045);
+            let mapped_dye = vec3<f32>(1.0) - exp(-dye.rgb * 1.4);
+            color = bg + mapped_dye;
         }
     }
 

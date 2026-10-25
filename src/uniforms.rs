@@ -14,7 +14,7 @@ use bytemuck::{Pod, Zeroable};
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum DisplayMode {
-    /// Renders the high-resolution advected dye field (`dye.rgb`).
+    /// Renders the physically inspired "Milk in Coffee" shader (Beer-Lambert absorption + rim lighting).
     Dye = 0,
     /// Visualizes the 2D velocity vector field using an HSV color wheel (angle = hue, speed = brightness).
     Velocity = 1,
@@ -22,19 +22,32 @@ pub enum DisplayMode {
     Pressure = 2,
     /// Visualizes the post-projection velocity divergence $\nabla \cdot \mathbf{u}$ using a red/blue heatmap.
     Divergence = 3,
+    /// Visualizes the 2D scalar vorticity (curl $\omega = \nabla \times \mathbf{u}$) using a red/blue heatmap.
+    Curl = 4,
+    /// Renders the raw RGB dye pigment channels (`dye.rgb`) with exponential tonemapping.
+    RawDye = 5,
 }
 
 impl DisplayMode {
     /// All available display modes for populating UI dropdowns.
-    pub const ALL: [Self; 4] = [Self::Dye, Self::Velocity, Self::Pressure, Self::Divergence];
+    pub const ALL: [Self; 6] = [
+        Self::Dye,
+        Self::RawDye,
+        Self::Velocity,
+        Self::Curl,
+        Self::Pressure,
+        Self::Divergence,
+    ];
 
     /// Returns a human-readable label for the `egui` combo box.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Dye => "Dye (Artistic)",
+            Self::Dye => "Milk in Coffee (Artistic)",
+            Self::RawDye => "Raw Dye (RGB)",
             Self::Velocity => "Velocity (HSV)",
             Self::Pressure => "Pressure (Heatmap)",
             Self::Divergence => "Divergence (Post-Projection)",
+            Self::Curl => "Curl / Vorticity (Heatmap)",
         }
     }
 
@@ -42,7 +55,10 @@ impl DisplayMode {
     pub fn tooltip(self) -> &'static str {
         match self {
             Self::Dye => {
-                "Renders the high-resolution (1024×1024) passive dye pigment advected through the velocity field."
+                "Maps scalar milk concentration through a Beer-Lambert exponential absorption curve (espresso → golden caramel → steamed cream) with subtle gradient-based specular rim lighting."
+            }
+            Self::RawDye => {
+                "Renders the raw RGB channels of the high-resolution dye texture using custom brush colors."
             }
             Self::Velocity => {
                 "Visualizes the 2D velocity vector field u = (ux, uy): direction angle maps to hue (color wheel) and speed maps to brightness."
@@ -52,6 +68,9 @@ impl DisplayMode {
             }
             Self::Divergence => {
                 "Visualizes velocity divergence (∇ · u) after projection. For an incompressible fluid with ~35 Jacobi iterations, this stays nearly black; lower Jacobi iterations to see un-cancelled compression (blue) and expansion (red)."
+            }
+            Self::Curl => {
+                "Visualizes 2D scalar vorticity ω = ∂uy/∂x - ∂ux/∂y: warm orange/red = counterclockwise spin, cool blue = clockwise spin. Vorticity Confinement amplifies these cores."
             }
         }
     }

@@ -61,9 +61,9 @@ Trying to solve all terms of the Navier-Stokes equations simultaneously in one g
 In [`FluidSolver::step`](./src/solver.rs), each frame runs:
 
 ```text
-[Pass 1: Splat] ──► [Pass 2: Advect Velocity] ──► [Pass 3: Divergence]
-                                                          │
-[Pass 6: Advect Dye] ◄── [Pass 5: Project Velocity] ◄── [Pass 4: Jacobi Pressure (×35)]
+[Pass 1: Splat] ──► [Pass 2: Vorticity Confinement] ──► [Pass 3: Advect Velocity]
+                                                                  │
+[Pass 7: Advect Dye] ◄── [Pass 6: Project Velocity] ◄── [Passes 4–5: Divergence & Jacobi (×35)]
 ```
 
 *(You can toggle each of these stages on and off live in the left sidebar under **Pipeline Stages & Algorithms**!)*
@@ -121,7 +121,32 @@ let advected = sample_advect(source_in, prev_uv, params.sim_size);
 ### Why Is Semi-Lagrangian Advection Unconditionally Stable?
 Bilinear interpolation is a weighted average (with weights in $[0, 1]$ summing to $1$) of four existing texel values. A weighted average can **never** produce a value larger than the maximum or smaller than the minimum of the previous frame! No matter how large $\Delta t$ or $\mathbf{u}$ is, the simulation can never blow up.
 
-*(The tradeoff is **numerical dissipation**: averaging 4 texels every frame acts like a slight Gaussian blur. In Milestone 4, we will upgrade this to **MacCormack Advection** to cancel out that blur!)*
+*(The tradeoff of basic Semi-Lagrangian advection is **numerical dissipation**: averaging 4 texels every frame acts like a slight Gaussian blur. See below for how **MacCormack Advection** cancels out that blur!)*
+
+### Upgrading to 2nd-Order MacCormack Advection
+To prevent thin ribbons of cream from blurring away over time, [`src/shaders/advect.wgsl`](./src/shaders/advect.wgsl) implements **MacCormack Advection** (Selle et al., 2008):
+
+1. **Predictor Step ($\hat{\phi}^{n+1}$)**: Run the standard backward trace from time $n$ to $n+1$ and store the result in a scratch texture (`scratch_vel` / `scratch_dye`):
+   $$\hat{\phi}^{n+1}(\mathbf{x}) = \phi^n(\mathbf{x} - \Delta t \, \mathbf{u}(\mathbf{x}))$$
+2. **Backward Error Trace ($\hat{\phi}^n$)**: Trace $\hat{\phi}^{n+1}$ *forward* along $+\Delta t \, \mathbf{u}(\mathbf{x})$ back to time $n$:
+   $$\hat{\phi}^n(\mathbf{x}) = \hat{\phi}^{n+1}(\mathbf{x} + \Delta t \, \mathbf{u}(\mathbf{x}))$$
+3. **Error Cancellation**: If interpolation had zero error, $\hat{\phi}^n$ would equal $\phi^n$. Their difference $\phi^n - \hat{\phi}^n$ equals twice the single-step truncation error! Adding half that difference back cancels out first-order numerical diffusion:
+   $$\phi_{\text{corr}}^{n+1}(\mathbf{x}) = \hat{\phi}^{n+1}(\mathbf{x}) + \frac{1}{2}\left(\phi^n(\mathbf{x}) - \hat{\phi}^n(\mathbf{x})\right)$$
+4. **Total Variation Diminishing (TVD) Clamping**: Second-order polynomials can overshoot near sharp edges (Gibbs ringing). `clamp_to_local_extrema` in [`advect.wgsl`](./src/shaders/advect.wgsl) clamps $\phi_{\text{corr}}^{n+1}$ to the `[min, max]` of the 4 texels of $\phi^n$ surrounding $\mathbf{x}_{\text{prev}}$, guaranteeing unconditional stability with razor-sharp edges!
+
+### Restoring Turbulent Curls: Vorticity Confinement ([`src/shaders/vorticity.wgsl`](./src/shaders/vorticity.wgsl))
+Even with MacCormack advection, a finite `512×512` velocity grid cannot resolve sub-pixel eddies, so rotational energy gradually damps out. **Vorticity Confinement** (Fedkiw, Stam & Jensen, 2001) measures where vortices are spinning and gives them a gentle tangential boost:
+
+1. **Compute 2D Scalar Curl (`compute_curl`)**:
+   $$\omega(i, j) = \nabla \times \mathbf{u} = \frac{\partial u_y}{\partial x} - \frac{\partial u_x}{\partial y}$$
+   Positive $\omega$ means counterclockwise spin; negative $\omega$ means clockwise spin.
+2. **Find the Vortex Core Direction (`apply_vorticity`)**:
+   We take the spatial gradient of the curl *magnitude* $\boldsymbol{\eta} = \nabla |\omega|$ and normalize it:
+   $$\mathbf{N} = \frac{\nabla |\omega|}{\|\nabla |\omega\| + \epsilon}$$
+   Because $|\omega|$ peaks at the center of a vortex, $\mathbf{N}$ points radially **inward** toward the nearest vortex core.
+3. **Apply the Cross-Product Booster Force**:
+   Taking the cross product $\mathbf{N} \times \boldsymbol{\omega}$ produces a vector strictly **tangent** to the spinning vortex, accelerating the swirl in the exact direction it is already rotating:
+   $$\mathbf{f}_{\text{vort}} = \varepsilon \left( N_y \, \omega,\; -N_x \, \omega \right)$$
 
 ### GPU Subtlety: 8-bit Hardware Samplers vs. 32-bit `bilerp`
 When you call WebGPU's built-in hardware sampler (`textureSampleLevel`), the GPU's texture unit computes the fractional position between texels using **8-bit fixed-point arithmetic** ($1/256$ of a texel).
@@ -182,11 +207,16 @@ Look at what happens physically when you push the mouse to the right:
 
 ---
 
-## 7. Fullscreen Procedural Rendering ([`src/shaders/render.wgsl`](./src/shaders/render.wgsl))
+## 7. Fullscreen Procedural Rendering & "Milk in Coffee" Shading ([`src/shaders/render.wgsl`](./src/shaders/render.wgsl))
 
 To draw the 2D textures onto the window, we don't even allocate a vertex buffer:
 - `rpass.draw(0..3, 0..1)` invokes `vs_main` three times with `@builtin(vertex_index)` equal to `0`, `1`, and `2`.
 - Bitwise shifts map those three indices to clip-space coordinates `(-1, -1)`, `(3, -1)`, and `(-1, 3)`—a single giant right triangle that completely covers the `[-1, 1] × [-1, 1]` screen box without the diagonal seam of a two-triangle quad.
+
+### Beer-Lambert Absorption & Rim Lighting (`shade_milk_in_coffee`)
+When you pour steamed milk into dark espresso, the transition isn't a linear RGB lerp between black and white:
+1. **Exponential Absorption & Subsurface Scattering**: Thin filaments of milk ($m \in (0, 0.3)$) suspended in dark coffee preferentially scatter warm amber/red wavelengths before light is absorbed by the espresso, producing a rich **golden caramel halo** (`caramel_mid`) around every white cream ribbon (`cream_white`). We model this with a two-stage Beer-Lambert exponential curve ($1 - e^{-k m}$).
+2. **Gradient Specular Rim Lighting**: By taking finite differences of the milk concentration $\nabla m = (\partial_x m, \partial_y m)$ across neighboring `1024×1024` (or `2048×2048`) dye texels, we construct a surface normal $\mathbf{n} = \text{normalize}(-3.5\,\nabla m, 1.0)$ and apply Blinn-Phong specular highlights along the curling edges.
 
 ---
 
@@ -196,12 +226,14 @@ Launch the simulator (`cargo run --release`) and try these interactive experimen
 
 1. **Incompressible Vortices vs. Compressible Shockwaves**:
    - Drag a short stroke in the middle of the canvas with all defaults enabled: watch the two counter-rotating vortices curl smoothly.
-   - Now uncheck **2. Pressure Projection ($\nabla \cdot \mathbf{u} = 0$)** and drag again: watch the fluid pile up into a flat, jagged Burgers shockwave with zero curl!
-2. **Visualizing the Pressure Dipole**:
-   - Switch **Display Mode** to **Pressure (Heatmap)** and drag the mouse. You will see a bright orange/red high-pressure lobe leading your cursor and a cool blue low-pressure suction lobe trailing behind it.
-3. **Watching Jacobi Convergence Live**:
-   - Switch **Display Mode** to **Divergence (Post-Projection)**.
-   - At `35` Jacobi iterations, the canvas stays nearly pitch black ($\nabla \cdot \mathbf{u} \approx 0$).
-   - Uncheck **Warm-Start Pressure** and drag **Jacobi Iterations** down to `2`: the divergence view lights up with un-cancelled red/blue compressibility!
-4. **Stepping Frame-by-Frame**:
-   - Click **⏸ Pause**, drag on the canvas to inject an impulse, and click **⏭ Step 1 Frame** while switching between **Velocity**, **Pressure**, **Divergence**, and **Dye** to inspect each field on the exact same timestep.
+   - Now uncheck **3. Pressure Projection ($\nabla \cdot \mathbf{u} = 0$)** and drag again: watch the fluid pile up into a flat, jagged Burgers shockwave with zero curl!
+2. **MacCormack vs. Semi-Lagrangian Sharpness**:
+   - Swirl some milk into the coffee with **MacCormack Advection (2nd-Order)** checked, then uncheck it: notice how 1st-order Semi-Lagrangian blurs thin caramel filaments much faster.
+3. **Vorticity Confinement & Curl Inspection**:
+   - Switch **Display Mode** to **Curl / Vorticity (Heatmap)** to see red (counterclockwise) and blue (clockwise) vortex cores trailing your cursor.
+   - Switch back to **Milk in Coffee (Artistic)** and drag **Vorticity ($\varepsilon$)** from `0` up to `35` to watch large plumes break into delicate fractal curls.
+4. **Decoupled Dye Grid Resolution (`512²` vs `1024²` vs `2048²`)**:
+   - Click `2048²` next to **Dye Grid** at the bottom of the panel: even though the velocity/pressure solver still runs at `512×512`, the cream ribbons become ultra-crisp at `2048×2048`.
+5. **Visualizing the Pressure Dipole & Jacobi Convergence**:
+   - Switch **Display Mode** to **Pressure (Heatmap)** and drag the mouse to see the orange/red high-pressure front and blue low-pressure wake.
+   - Switch to **Divergence (Post-Projection)**, uncheck **Warm-Start Pressure**, and lower **Jacobi Iterations** to `2` to see un-cancelled compressibility.
