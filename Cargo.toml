@@ -9,7 +9,7 @@ bytemuck = { version = "1.21", features = ["derive"] }
 egui = "0.31"
 egui-wgpu = "0.31"
 egui-winit = { version = "0.31", default-features = false, features = ["links"] }
-glam = { version = "0.29", features = ["bytemuck"] }
+glam = { version = "0.34", features = ["bytemuck"] }
 log = "0.4"
 wgpu = "24.0"
 winit = "0.30"
