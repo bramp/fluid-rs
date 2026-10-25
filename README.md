@@ -31,6 +31,30 @@ trunk serve --release
 
 Then open `http://127.0.0.1:8080` in a WebGPU-capable browser.
 
+### Automatic Deployment (GitHub Pages)
+
+The [deployment workflow](./.github/workflows/deploy.yml) builds the release
+WebAssembly app with Trunk and deploys it on every push to `main`. It can also be
+run manually from **Actions > Deploy web app to GitHub Pages > Run workflow**.
+
+One-time repository setup:
+
+1. Open **Settings > Pages > Build and deployment** and select **GitHub Actions**
+   as the source (not "Deploy from a branch").
+2. Ensure GitHub Actions is enabled under **Settings > Actions > General** and
+   repository or organization policies allow the actions used by the workflow.
+3. Push the workflow to `main`, or run it manually if it is already on `main`.
+   If the `github-pages` environment requires approval, approve the deployment
+   in the workflow run.
+
+The app will be published at **https://bramp.github.io/fluid-rs/**. No custom
+secrets, personal access token, or hosting service is required: the workflow uses
+GitHub's built-in `GITHUB_TOKEN` with scoped Pages deployment permissions. Asset
+URLs use the Pages base path, so the `/fluid-rs/` project subdirectory works.
+
+The hosted app still requires a WebGPU-capable browser and GPU. GitHub Pages
+provides HTTPS, which WebGPU requires outside localhost.
+
 ---
 
 ## Project Structure
