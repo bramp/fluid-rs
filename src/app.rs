@@ -166,7 +166,12 @@ impl AppState {
                         {
                             self.last_mouse_uv = Some(uv);
                             self.solver.params.splat_pos = [uv.x, uv.y];
-                            self.solver.params.splat_vel = [0.0, 0.0];
+                            self.solver.params.splat_vel =
+                                if self.brush_tool == BrushTool::FluidAndDye {
+                                    [0.0, 0.0]
+                                } else {
+                                    [uv.x, uv.y]
+                                };
                             self.solver.params.splat_active = 1;
                         }
                     } else if state == ElementState::Released {
@@ -183,12 +188,14 @@ impl AppState {
                         if let Some(pos) = self.last_cursor_pos
                             && let Some(uv) = self.cursor_to_canvas_uv(pos)
                         {
+                            self.last_mouse_uv = Some(uv);
                             self.solver.params.splat_pos = [uv.x, uv.y];
-                            self.solver.params.splat_vel = [0.0, 0.0];
+                            self.solver.params.splat_vel = [uv.x, uv.y];
                             self.solver.params.splat_active = 1;
                         }
                     } else if state == ElementState::Released {
                         self.right_mouse_down = false;
+                        self.last_mouse_uv = None;
                         if !self.mouse_down {
                             self.solver.params.splat_active = 0;
                         }
@@ -200,14 +207,26 @@ impl AppState {
                 self.last_cursor_pos = Some(position);
                 if (self.mouse_down || self.right_mouse_down) && !egui_response.consumed {
                     if let Some(uv) = self.cursor_to_canvas_uv(position) {
-                        // Compute cursor movement delta since the last mouse event and scale by
-                        // `SIM_RES` so velocity is expressed in simulation grid texels per second.
                         let prev = self.last_mouse_uv.unwrap_or(uv);
-                        let delta = (uv - prev) * (SIM_RES as f32) * self.splat_force;
-                        self.last_mouse_uv = Some(uv);
+                        let is_obstacle_mode =
+                            self.right_mouse_down || self.brush_tool != BrushTool::FluidAndDye;
 
-                        self.solver.params.splat_pos = [uv.x, uv.y];
-                        self.solver.params.splat_vel = [delta.x, delta.y];
+                        if is_obstacle_mode {
+                            // Low-pass filter the cursor trajectory so hand jitter turns into a
+                            // smooth, straight-ish stone ridge, and pass the line segment `[prev, smoothed]`
+                            // in `(splat_vel, splat_pos)` for capsule SDF evaluation in `paint_obstacles`.
+                            let smoothed = prev.lerp(uv, 0.38);
+                            self.last_mouse_uv = Some(smoothed);
+                            self.solver.params.splat_vel = [prev.x, prev.y];
+                            self.solver.params.splat_pos = [smoothed.x, smoothed.y];
+                        } else {
+                            // Compute cursor movement delta since the last mouse event and scale by
+                            // `SIM_RES` so velocity is expressed in simulation grid texels per second.
+                            let delta = (uv - prev) * (SIM_RES as f32) * self.splat_force;
+                            self.last_mouse_uv = Some(uv);
+                            self.solver.params.splat_pos = [uv.x, uv.y];
+                            self.solver.params.splat_vel = [delta.x, delta.y];
+                        }
                         self.solver.params.splat_active = 1;
                     } else {
                         self.solver.params.splat_active = 0;
@@ -598,10 +617,14 @@ impl AppState {
             );
         }
 
-        // If the mouse button is held down without moving, zero the velocity delta so we
-        // don't keep re-injecting the previous frame's movement impulse.
-        if self.mouse_down {
-            self.solver.params.splat_vel = [0.0, 0.0];
+        // If the mouse button is held down without moving, zero the velocity delta in fluid mode
+        // or collapse the capsule segment `[a, b]` to `[pos, pos]` in obstacle mode.
+        if self.mouse_down || self.right_mouse_down {
+            if self.solver.params.obstacle_brush_mode != 0 {
+                self.solver.params.splat_vel = self.solver.params.splat_pos;
+            } else {
+                self.solver.params.splat_vel = [0.0, 0.0];
+            }
         }
 
         // 2. Render the fluid simulation into the viewport region to the right of the side panel.

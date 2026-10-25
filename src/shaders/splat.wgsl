@@ -18,8 +18,24 @@ fn gaussian_splat(uv: vec2<f32>, center: vec2<f32>, radius: f32, aspect: f32) ->
     return exp(-dist_sq / max(radius * radius, 1e-6));
 }
 
-// Paints or erases circular solid rock obstacles (`obs_in` -> `obs_out`) when
+// Computes the shortest aspect-corrected vector from point `p` to the line segment `[a, b]`.
+// Using a capsule segment instead of a point circle ensures that dragging the mouse produces
+// a single continuous, flat-topped stone ridge rather than a beaded string of separate peaks.
+fn vector_to_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, aspect: f32) -> vec2<f32> {
+    let pa = vec2<f32>((p.x - a.x) * aspect, p.y - a.y);
+    let ba = vec2<f32>((b.x - a.x) * aspect, b.y - a.y);
+    let len_sq = dot(ba, ba);
+    if len_sq < 1e-8 {
+        return pa;
+    }
+    let h = clamp(dot(pa, ba) / len_sq, 0.0, 1.0);
+    return pa - ba * h;
+}
+
+// Paints or erases continuous capsule-segment rock ridges (`obs_in` -> `obs_out`) when
 // `params.splat_active != 0u` and `params.obstacle_brush_mode` is `1` (Paint) or `2` (Erase).
+// When `obstacle_brush_mode != 0u`, `params.splat_vel` carries the previous smoothed cursor UV `a`
+// and `params.splat_pos` carries the current smoothed cursor UV `b`.
 @compute @workgroup_size(8, 8, 1)
 fn paint_obstacles(@builtin(global_invocation_id) id: vec3<u32>) {
     let dims = vec2<u32>(params.sim_size);
@@ -33,18 +49,17 @@ fn paint_obstacles(@builtin(global_invocation_id) id: vec3<u32>) {
     if params.splat_active != 0u && params.obstacle_brush_mode != 0u {
         let uv = texel_to_uv(coords, params.inv_sim_size);
         let aspect = params.sim_size.x * params.inv_sim_size.y;
-        let dx = (uv.x - params.splat_pos.x) * aspect;
-        let dy = uv.y - params.splat_pos.y;
-        let dist = sqrt(dx * dx + dy * dy);
+        let seg_vec = vector_to_segment(uv, params.splat_vel, params.splat_pos, aspect);
+        let dist = length(seg_vec);
         let brush_r = params.splat_radius * 1.5;
 
         if dist <= brush_r {
             if params.obstacle_brush_mode == 1u {
                 let norm_r = clamp(dist / max(brush_r, 1e-5), 0.0, 1.0);
-                let n = select(vec2<f32>(0.0), vec2<f32>(dx, dy) / dist, dist > 1e-5);
+                let n = select(vec2<f32>(0.0), seg_vec / dist, dist > 1e-5);
+                // Smooth ridge cross-section ($1 - r^2$) that stays continuous along the spine.
                 let dome = sqrt(max(1.0 - norm_r * norm_r, 0.0));
-                // Smoothly merge with any existing obstacle dome height.
-                if dome >= obs.a {
+                if dome >= obs.w {
                     obs = vec4<f32>(1.0, n.x, n.y, dome);
                 }
             } else {
