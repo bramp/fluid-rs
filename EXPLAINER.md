@@ -240,23 +240,23 @@ $$f_y = +\alpha \, c_{\text{heavy}} - \beta \, (c_{\text{buoyant}} - c_{\text{am
 
 *(In screen coordinates where $y = 0$ is top and $y = 1$ is bottom, $+y$ is downward gravity $\alpha$ and $-y$ is upward buoyancy lift $\beta$.)*
 
-### Why Do Bubbles in a Pint of Guinness Sink? (The Boycott Effect)
+### Why Do Bubbles in a Pint of Guinness Sink? (First-Principles Boycott Effect)
 It seems to defy gravity: nitrogen bubbles are buoyant, yet when you watch a settling pint of Guinness (**Scenario 3: The Guinness Pour**), waves of bubbles clearly roll **downward** along the glass walls!
-The secret is the **geometry of the pint glass** combined with **two-phase slip velocity** (the **Boycott Effect**, discovered by Arthur Boycott in 1920 and proven for stout beer by Benilov, Cummins & Lee in 2012):
 
-1. **Outward-Sloping Pint Glass Walls (`pint_glass_half_width`)**:
-   A pint glass is narrower at the base ($v = 0.92$) and wider toward the top ($v = 0.22$).
-2. **Vertical Bubble Slip (`sample_dye_velocity` in [`advect.wgsl`](./src/shaders/advect.wgsl))**:
-   Tiny nitrogen micro-bubbles rise straight up relative to the liquid with terminal slip speed $u_{\text{slip}}$. Because the glass walls slant *outward*, rising bubbles move **away** from the sloped walls, leaving a thin boundary layer of **bubble-depleted (heavier) stout** right against the glass walls!
-3. **Global Circulation Loop & Multi-Phase Foam Accretion (`buoyancy.wgsl` + `splat.wgsl` + `advect.wgsl`)**:
-   - The **bubble-rich central core** is lighter than the surrounding liquid and surges rapidly **upward** ($-y$, driven by $\beta$).
-   - The **bubble-depleted outer wall layer** is heavier than the core and sinks **downward** ($+y$, driven by $\alpha$) along the slanted walls.
-   - Because the downward liquid speed along the walls ($+55\text{ px/s}$) is faster than the tiny upward slip speed of nitrogen micro-bubbles ($-20\text{ px/s}$), the sinking liquid **drags the visible micro-bubbles downward** (`+55 - 20 = +35 > 0`) in rolling Kelvin-Helmholtz waves!
-   - **Why the Pint Clears from the Bottom Up while the Head Grows Downward**:
-     We track three distinct phases in the `dye` texture channels:
-     1. **Dissolved Nitrogen Gas (`dye.g`)**: Slowly nucleates into new micro-bubbles (`dye.a`) during the initial surge.
-     2. **Suspended Micro-Bubbles (`dye.a`)**: Conserved (`dye_dissipation = 1.0`) while swirling and rising with upward slip velocity. Because no new bubbles can enter from below the solid glass floor (`raw_prev_uv.y > 0.91`), a **ruby-mahogany clearing front** starts at the bottom of the glass and marches steadily upward behind the rising bubble cloud.
-     3. **Floating Creamy Foam Head (`dye.r`)**: Starts as a paper-thin collar at the top rim (`uv.y = 0.07`). Whenever rising micro-bubbles (`dye.a`) hit a cell immediately beneath existing packed foam (`foam_above > 0.55`), they coalesce into the underside of the foam head (`dye.r` increases while `dye.a` is consumed)—causing the **creamy ivory head to visibly grow downward** until the rising ruby-mahogany clearing front meets it from below!
+Remarkably, our simulator does **not** use any scripted radial velocity profiles or sine-wave formulas to fake this—the entire cascade, roll waves, downward-growing foam head, and final settling emerge from **three first-principles equations** (following Benilov, Cummins & Lee 2012 *"Why do bubbles in Guinness sink?"* and Watamura et al. 2019 *"Bubble cascade in Guinness beer is caused by gravity current instability"*):
+
+1. **Outward-Sloping Glass Walls + Upward Bubble Slip (`boycott_zero_influx_mask` in [`advect.wgsl`](./src/shaders/advect.wgsl))**:
+   - Micro-bubbles (`dye.a`) move at $\mathbf{u}_{\text{bubble}} = \mathbf{u}_{\text{liquid}} + (0, -v_{\text{slip}})$.
+   - Because the pint glass is narrower at the base ($v = 0.92$) and wider toward the top ($v = 0.22$), its side walls slant *outward*. As bubbles slip vertically upward, they move **away** from the sloped walls!
+   - When a backward bubble trace (`raw_prev_uv = uv - dt * u_bubble`) originates inside the solid glass wall or floor, **zero bubbles can emerge out of solid glass (`phi = 0`)**. That kinematic boundary condition automatically creates a thin, clear, bubble-depleted film ($\phi \approx 0$) along the slanted outer walls!
+2. **Pure Cross-Sectional Boussinesq Buoyancy ([`buoyancy.wgsl`](./src/shaders/buoyancy.wgsl))**:
+   - In a closed container, hydrostatic pressure balances the horizontal cross-sectional average bubble concentration $\bar{\phi}(y)$ at every height $y$, leaving the net vertical Boussinesq acceleration:
+     $$f_y(x, y) = -\beta \left(\phi(x, y) - \bar{\phi}(y)\right)$$
+   - Wherever $\phi(x, y) < \bar{\phi}(y)$ (the bubble-depleted film along the slanted walls), $f_y > 0$: the clear wall layer is **heavier** than the bubble-rich interior and plunges **downward** as a high-speed gravity current!
+   - Shear between that descending wall gravity current and the rising interior triggers natural **Kelvin-Helmholtz / roll-wave instabilities** that drag visible waves of interior bubbles downward along the glass walls.
+3. **Top Phase Separation & Stefan Foam Interface ([`splat.wgsl`](./src/shaders/splat.wgsl))**:
+   - When the rising central plume reaches the underside of the floating foam head (`dye.r`), the incompressible liquid must turn sideways toward the walls, while buoyant bubbles separate upward and pack onto the underside of the foam head.
+   - This both drives the **creamy ivory foam head interface downward** over time *and* strips bubbles out of the recirculating liquid so the pint clears from the bottom up and comes to complete rest once $\phi(x, y) \to 0$!
 
 ---
 

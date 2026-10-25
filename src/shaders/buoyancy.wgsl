@@ -60,47 +60,48 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let dye = bilerp(dye_in, uv, params.dye_size);
 
     if params.scenario_mode == 2u {
-        // --- The Guinness Pour (Two-Phase Boussinesq Boycott Convection) ---
-        let half_w = pint_glass_half_width(uv.y);
-        let dx = uv.x - 0.5;
-        let r_norm = abs(dx) / max(half_w, 1e-4);
-
+        // --- The Guinness Pour (First-Principles Boussinesq Boycott Convection) ---
+        // No scripted radial profiles or sine waves!
+        // 1. Inside the packed floating foam head (`dye.r > 0.5`), high foam viscosity damps motion.
         let foam = dye.r;
-        let bubbles = dye.a;
-
-        // Inside the packed foam head (`foam > 0.55`), high foam viscosity damps fluid motion
-        // so the growing creamy head stays calm and level on top of the churning stout below!
-        if foam > 0.55 {
-            vel *= 0.82;
+        if foam > 0.50 {
+            vel *= mix(1.0, 0.75, smoothstep(0.50, 0.85, foam));
             textureStore(vel_out, coords, vec4<f32>(vel, 0.0, 1.0));
             return;
         }
 
-        if uv.y > 0.075 && uv.y < 0.91 && r_norm < 0.98 {
-            // Sample the bubble concentration on the central axis `(0.5, uv.y)` at this height.
-            // Why? The Boycott effect is driven by the horizontal density contrast between the
-            // bubble-rich core and the bubble-depleted slanted wall! Once all bubbles at height `uv.y`
-            // have risen into the foam head (`core_bubbles -> 0`), both `core_lift` and `wall_sink`
-            // naturally vanish from the bottom up and the pint settles to rest!
-            let core_bubbles = bilerp(dye_in, vec2<f32>(0.5, uv.y), params.dye_size).a;
-            let active_surge = clamp(max(bubbles, core_bubbles), 0.0, 1.2);
+        let half_w = pint_glass_half_width(uv.y);
+        let dx = uv.x - 0.5;
+        if uv.y > 0.070 && uv.y < 0.915 && abs(dx) < half_w {
+            let phi_local = dye.a;
 
-            let core_lift = smoothstep(0.70, 0.26, r_norm) * bubbles * params.buoyancy_beta * 26.0;
-            let wall_sink = smoothstep(0.55, 0.85, r_norm) * (1.0 - smoothstep(0.94, 1.0, r_norm))
-                * active_surge * params.buoyancy_alpha * 32.0;
+            // 2. Compute the cross-sectional average bubble volume fraction $\bar{\phi}(y)$
+            //    across the pint glass width `[-half_w, +half_w]` at height `uv.y`.
+            //    In a closed container, hydrostatic pressure automatically balances the horizontal
+            //    mean buoyancy $\bar{\phi}(y)$, so the net Boussinesq vertical body force at $(x, y)$ is:
+            //
+            //    $$f_y(x, y) = -\beta \left(\phi(x, y) - \bar{\phi}(y)\right)$$
+            //
+            //    - Where bubbles have slipped upward away from the outward-sloping glass walls,
+            //      $\phi(x, y) < \bar{\phi}(y) \implies f_y > 0$ (the bubble-depleted wall film
+            //      is heavier than the interior and sinks downward as a gravity current!).
+            //    - In the bubble-rich interior, $\phi(x, y) > \bar{\phi}(y) \implies f_y < 0$ (rises!).
+            //    - Once all bubbles have risen into the foam head ($\phi \to 0$ everywhere in the liquid),
+            //      $\phi(x, y) - \bar{\phi}(y) \equiv 0 \implies f_y \equiv 0$, and the pint comes to rest!
+            var phi_sum = 0.0;
+            let num_samples = 11;
+            for (var i = 0; i < num_samples; i = i + 1) {
+                let frac = (f32(i) + 0.5) / f32(num_samples) * 2.0 - 1.0;
+                let sample_u = 0.5 + frac * (half_w * 0.96);
+                phi_sum += bilerp(dye_in, vec2<f32>(sample_u, uv.y), params.dye_size).a;
+            }
+            let phi_mean = phi_sum / f32(num_samples);
 
-            // Vertical Boussinesq acceleration (negative Y = upward, positive Y = downward).
-            let fy = wall_sink - core_lift;
+            // Relative Boussinesq buoyancy: negative Y is upward lift, positive Y is downward sinking.
+            let delta_phi = phi_local - phi_mean;
+            let buoyancy_scale = select(params.buoyancy_alpha * 55.0, params.buoyancy_beta * 42.0, delta_phi >= 0.0);
+            let fy = -delta_phi * buoyancy_scale;
             vel.y += params.dt * fy;
-
-            // Follow the outward slant of the pint glass along the descending wall boundary layer,
-            // plus a Kelvin-Helmholtz wave perturbation along the shear interface (`r_norm ~ 0.68`)
-            // that triggers the characteristic cascading horizontal ripple bands while settling!
-            let wall_sign = sign(dx);
-            let glass_slope = -0.14 * wall_sign * smoothstep(0.60, 0.90, r_norm);
-            let shear_zone = smoothstep(0.45, 0.68, r_norm) * (1.0 - smoothstep(0.68, 0.92, r_norm));
-            let wave_ripple = sin(uv.y * 38.0 - bubbles * 9.0) * shear_zone * active_surge * params.buoyancy_alpha * 6.0;
-            vel.x += params.dt * (glass_slope * wall_sink + wave_ripple * wall_sign);
         }
     } else {
         // --- Milk in Coffee / General Boussinesq Gravity & Thermal Convection ---

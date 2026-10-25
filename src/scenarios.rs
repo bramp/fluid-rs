@@ -268,20 +268,16 @@ fn upload_guinness_pint_glass_and_initial_state(
 
             if signed_outside > -aa {
                 let coverage = smoothstep(-aa, aa, signed_outside);
-                // Normal pointing inward into the liquid cavity so `push_uv_outside_obstacle` pushes samples into the pint!
+                // Normal pointing inward into the liquid cavity.
                 let nx = if dx >= 0.0 { -0.98 } else { 0.98 };
                 let ny = -0.18;
                 let dome = (1.0 - (signed_outside / 0.04).clamp(0.0, 1.0)).max(0.2);
                 obs_pixels[idx] = [coverage, nx, ny, dome];
             } else {
-                // Seed initial Boycott circulation inside the pint glass:
-                // rising bubble column in the center (`r_norm < 0.6`) and sinking cascade along the outer walls!
-                let r_norm = abs_dx / half_w.max(1e-4);
-                let vert_env = smoothstep(0.08, 0.18, v) * (1.0 - smoothstep(0.82, 0.91, v));
-                let vy = (-65.0 * (1.0 - smoothstep(0.0, 0.65, r_norm))
-                    + 55.0 * smoothstep(0.55, 0.88, r_norm))
-                    * vert_env;
-                vel_pixels[idx] = [0.0, vy, 0.0, 1.0];
+                // Start from rest (`vel = 0`): the Boycott circulation and downward wall cascade
+                // emerge 100% naturally from upward bubble slip away from the outward-sloping
+                // pint glass walls (`boycott_zero_influx_mask`) and Boussinesq buoyancy!
+                vel_pixels[idx] = [0.0, 0.0, 0.0, 1.0];
             }
         }
     }
@@ -335,21 +331,18 @@ fn upload_guinness_pint_glass_and_initial_state(
             let abs_dx = dx.abs();
             if (0.065..=0.92).contains(&v) && abs_dx <= half_w {
                 let r_norm = abs_dx / half_w.max(1e-4);
-                let wave = 0.5 + 0.5 * (v * 46.0 + r_norm * 9.0).sin();
+                // Small natural pour turbulence in the initial bubble cloud (no scripted radial profile!).
+                let pour_turbulence =
+                    0.85 + 0.15 * (u * 37.0 + v * 29.0).sin() * (v * 53.0 - r_norm * 19.0).cos();
 
-                // Start with only a paper-thin foam collar at the very top rim (`v < 0.080`).
-                let initial_foam_collar = smoothstep(0.082, 0.069, v);
-
-                // Fill the liquid body with freshly entrained nitrogen micro-bubbles (`dye.a`)
-                // and dissolved nitrogen gas (`dye.g`).
-                let initial_bubbles = (1.0 - 0.22 * smoothstep(0.68, 0.98, r_norm))
-                    * (0.72 + 0.28 * wave)
-                    * smoothstep(0.92, 0.86, v)
-                    * (1.0 - initial_foam_collar * 0.8);
-                let dissolved_gas = 0.90 * smoothstep(0.92, 0.78, v) * (1.0 - initial_foam_collar);
+                // Start with only a 2-pixel surface meniscus of foam (`v < 0.072`) so the entire
+                // foam head grows downward dynamically as rising bubbles separate at the top!
+                let initial_meniscus = smoothstep(0.074, 0.067, v);
+                let initial_bubbles =
+                    pour_turbulence * smoothstep(0.92, 0.89, v) * (1.0 - initial_meniscus);
 
                 dye_pixels[(y * dye_w + x) as usize] =
-                    [initial_foam_collar, dissolved_gas, wave, initial_bubbles];
+                    [initial_meniscus, 0.0, 0.0, initial_bubbles];
             }
         }
     }

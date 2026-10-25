@@ -88,25 +88,36 @@ fn obstacle_boundary_dye(tex: texture_2d<f32>, uv: vec2<f32>, coords: vec2<i32>)
 }
 
 // Returns the effective dye/bubble advection velocity at `uv`.
-// In `Guinness` mode (`scenario_mode == 2`), nitrogen micro-bubbles have an upward terminal
-// slip velocity $u_{\text{slip}} = (0, -20)$ texels/sec relative to the liquid:
-// - In the center of the glass (`vel.y < 0`), bubbles surge rapidly upward.
-// - Near the slanted outer glass walls where dense liquid sinks faster than $20$ texels/sec
-//   (`vel.y > +20`), the sinking liquid overpowers the upward slip (`vel.y - 20 > 0`) and drags
-//   visible waves of nitrogen bubbles DOWNWARD along the walls!
-// - Because no new bubbles enter through the solid glass bottom (`uv.y = 0.92`), this upward
-//   slip velocity sweeps the bottom of the glass clear first, creating a rising ruby-dark
-//   clearing front that marches from the bottom of the pint up to the foam head!
+// In `Guinness` mode (`scenario_mode == 2`), nitrogen micro-bubbles move at the two-phase drift velocity:
+//
+// $$\mathbf{u}_{\text{bubble}}(x, y) = \mathbf{u}_{\text{liquid}}(x, y) + (0, -v_{\text{slip}})$$
+//
+// Why does this single equation cause the Boycott effect on an outward-sloping pint glass wall?
+// Because the pint glass is narrower at the base and wider at the top, its side walls slant outward.
+// As bubbles rise vertically with $-v_{\text{slip}}$, they drift *away* from the outward-sloping glass
+// walls! Since zero bubbles emerge from inside the solid glass wall (`boy_wall_factor` below), a thin
+// bubble-free layer ($\phi = 0$) forms naturally along the slanted glass walls and sinks as a heavy
+// gravity current!
 fn sample_dye_velocity(uv: vec2<f32>) -> vec2<f32> {
     var vel = bilerp(vel_in, uv, params.sim_size).xy;
     if params.scenario_mode == 2u {
         let current_foam = bilerp(source_in, uv, params.dye_size).r;
-        // Taper upward bubble slip to zero inside the packed foam head (`current_foam > 0.5`)
-        // so bubbles stop at the underside of the foam head and accrete onto it!
         let slip_mask = (1.0 - smoothstep(0.35, 0.75, current_foam)) * smoothstep(0.068, 0.095, uv.y);
-        vel.y -= 20.0 * slip_mask;
+        vel.y -= 24.0 * slip_mask;
     }
     return vel;
+}
+
+// Evaluates the kinematic zero-influx boundary condition for rising micro-bubbles at solid glass walls:
+// When a backward bubble trace `raw_prev_uv = uv - dt * u_bubble` originates inside the solid pint glass
+// wall or floor (`obs.x > 0.35`), **zero bubbles can come out of solid glass**!
+// This is the exact physical mechanism of the Boycott effect: vertical bubble slip away from an
+// outward-sloping wall leaves a bubble-depleted ($\phi = 0$) boundary layer along the wall.
+fn boycott_zero_influx_mask(raw_prev_uv: vec2<f32>) -> f32 {
+    let obs_at_origin = bilerp(obs_in, raw_prev_uv, params.sim_size).x;
+    let wall_clear = 1.0 - smoothstep(0.25, 0.55, obs_at_origin);
+    let floor_clear = smoothstep(0.918, 0.902, raw_prev_uv.y);
+    return wall_clear * floor_clear;
 }
 
 // Preserves the stationary floating foam head (`dye.r`) at `coords` in Guinness mode so the
@@ -163,15 +174,13 @@ fn advect_dye_predictor(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let vel = sample_dye_velocity(uv);
     let raw_prev_uv = uv - params.dt * vel * params.inv_sim_size;
-    let prev_uv = push_uv_outside_obstacle(raw_prev_uv);
+    let prev_uv = select(push_uv_outside_obstacle(raw_prev_uv), raw_prev_uv, params.scenario_mode == 2u);
 
     var advected = lock_floating_foam_channel(bilerp(source_in, prev_uv, params.dye_size), coords);
-    // In Guinness mode, no bubbles can enter from below the solid glass floor (`raw_prev_uv.y > 0.912`),
-    // so as bubbles slip upward away from the base, clear ruby-mahogany stout rises from the bottom up!
     if params.scenario_mode == 2u {
-        let floor_clear = smoothstep(0.918, 0.904, raw_prev_uv.y);
-        advected.a *= floor_clear;
-        advected.g *= floor_clear;
+        let mask = boycott_zero_influx_mask(raw_prev_uv);
+        advected.a *= mask;
+        advected.g *= mask;
     }
     textureStore(field_out, coords, advected);
 }
@@ -187,23 +196,28 @@ fn advect_dye(@builtin(global_invocation_id) id: vec3<u32>) {
     let coords = vec2<i32>(id.xy);
     let uv = texel_to_uv(coords, params.inv_dye_size);
     if is_obstacle_solid(bilerp(obs_in, uv, params.sim_size)) {
-        textureStore(field_out, coords, obstacle_boundary_dye(source_in, uv, coords));
+        let val = select(
+            obstacle_boundary_dye(source_in, uv, coords),
+            vec4<f32>(0.0),
+            params.scenario_mode == 2u,
+        );
+        textureStore(field_out, coords, val);
         return;
     }
 
     let vel = sample_dye_velocity(uv);
     let raw_prev_uv = uv - params.dt * vel * params.inv_sim_size;
-    let prev_uv = push_uv_outside_obstacle(raw_prev_uv);
+    let prev_uv = select(push_uv_outside_obstacle(raw_prev_uv), raw_prev_uv, params.scenario_mode == 2u);
 
     let advected = bilerp(source_in, prev_uv, params.dye_size);
 
     let dx = vec2<f32>(params.inv_dye_size.x, 0.0);
     let dy = vec2<f32>(0.0, params.inv_dye_size.y);
     let neighbor_avg = 0.25 * (
-        bilerp(source_in, push_uv_outside_obstacle(prev_uv - dx), params.dye_size) +
-        bilerp(source_in, push_uv_outside_obstacle(prev_uv + dx), params.dye_size) +
-        bilerp(source_in, push_uv_outside_obstacle(prev_uv - dy), params.dye_size) +
-        bilerp(source_in, push_uv_outside_obstacle(prev_uv + dy), params.dye_size)
+        bilerp(source_in, prev_uv - dx, params.dye_size) +
+        bilerp(source_in, prev_uv + dx, params.dye_size) +
+        bilerp(source_in, prev_uv - dy, params.dye_size) +
+        bilerp(source_in, prev_uv + dy, params.dye_size)
     );
     let kappa = clamp(params.dye_diffusion, 0.0, 0.5);
     var diffused = lock_floating_foam_channel(
@@ -211,9 +225,9 @@ fn advect_dye(@builtin(global_invocation_id) id: vec3<u32>) {
         coords,
     );
     if params.scenario_mode == 2u {
-        let floor_clear = smoothstep(0.918, 0.904, raw_prev_uv.y);
-        diffused.a *= floor_clear;
-        diffused.g *= floor_clear;
+        let mask = boycott_zero_influx_mask(raw_prev_uv);
+        diffused.a *= mask;
+        diffused.g *= mask;
     }
 
     textureStore(field_out, coords, diffused);
@@ -231,15 +245,24 @@ fn maccormack_dye(@builtin(global_invocation_id) id: vec3<u32>) {
     let coords = vec2<i32>(id.xy);
     let uv = texel_to_uv(coords, params.inv_dye_size);
     if is_obstacle_solid(bilerp(obs_in, uv, params.sim_size)) {
-        textureStore(field_out, coords, obstacle_boundary_dye(phi_hat_in, uv, coords));
+        let val = select(
+            obstacle_boundary_dye(phi_hat_in, uv, coords),
+            vec4<f32>(0.0),
+            params.scenario_mode == 2u,
+        );
+        textureStore(field_out, coords, val);
         return;
     }
 
     let vel = sample_dye_velocity(uv);
 
     let raw_prev_uv = uv - params.dt * vel * params.inv_sim_size;
-    let prev_uv = push_uv_outside_obstacle(raw_prev_uv);
-    let next_uv = push_uv_outside_obstacle(uv + params.dt * vel * params.inv_sim_size);
+    let prev_uv = select(push_uv_outside_obstacle(raw_prev_uv), raw_prev_uv, params.scenario_mode == 2u);
+    let next_uv = select(
+        push_uv_outside_obstacle(uv + params.dt * vel * params.inv_sim_size),
+        uv + params.dt * vel * params.inv_sim_size,
+        params.scenario_mode == 2u,
+    );
 
     let phi_n = textureLoad(source_in, coords, 0);
     let phi_hat_n1 = textureLoad(phi_hat_in, coords, 0);
@@ -263,9 +286,9 @@ fn maccormack_dye(@builtin(global_invocation_id) id: vec3<u32>) {
         coords,
     );
     if params.scenario_mode == 2u {
-        let floor_clear = smoothstep(0.918, 0.904, raw_prev_uv.y);
-        diffused.a *= floor_clear;
-        diffused.g *= floor_clear;
+        let mask = boycott_zero_influx_mask(raw_prev_uv);
+        diffused.a *= mask;
+        diffused.g *= mask;
     }
 
     textureStore(field_out, coords, diffused);
