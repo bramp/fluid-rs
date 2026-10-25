@@ -97,12 +97,23 @@ fn obstacle_boundary_dye(tex: texture_2d<f32>, uv: vec2<f32>, coords: vec2<i32>)
 fn sample_dye_velocity(uv: vec2<f32>) -> vec2<f32> {
     var vel = bilerp(vel_in, uv, params.sim_size).xy;
     if params.scenario_mode == 2u {
-        // Taper upward bubble slip to zero inside the top foam head (`uv.y < 0.12`) so bubbles
+        // Taper upward bubble slip to zero inside the top foam head (`uv.y < 0.14`) so bubbles
         // collect at the top meniscus rather than escaping through the top cap.
-        let slip_mask = smoothstep(0.08, 0.15, uv.y);
-        vel.y -= 16.0 * slip_mask;
+        let slip_mask = smoothstep(0.09, 0.15, uv.y);
+        vel.y -= 18.0 * slip_mask;
     }
     return vel;
+}
+
+// Applies scenario-aware dye retention: in `Guinness` mode (`scenario_mode == 2`), bubbles in the
+// top foam head (`uv.y < 0.145`) never dissipate (`retention = 1.0`), while suspended micro-bubbles
+// in the liquid body below gradually degas/rise into the head (`params.dye_dissipation`) so the
+// pint settles from the bottom up into clear ruby-black stout!
+fn effective_dye_retention(uv: vec2<f32>) -> f32 {
+    if params.scenario_mode == 2u {
+        return mix(1.0, params.dye_dissipation, smoothstep(0.13, 0.16, uv.y));
+    }
+    return params.dye_dissipation;
 }
 
 // --- 1st-Order Semi-Lagrangian Entrypoints (also used as MacCormack Predictor step) ---
@@ -182,7 +193,8 @@ fn advect_dye(@builtin(global_invocation_id) id: vec3<u32>) {
         bilerp(source_in, push_uv_outside_obstacle(prev_uv + dy), params.dye_size)
     );
     let kappa = clamp(params.dye_diffusion, 0.0, 0.5);
-    let diffused = mix(advected, neighbor_avg, kappa) * params.dye_dissipation;
+    let retention = effective_dye_retention(uv);
+    let diffused = mix(advected, neighbor_avg, kappa) * retention;
 
     textureStore(field_out, coords, diffused);
 }
@@ -225,7 +237,8 @@ fn maccormack_dye(@builtin(global_invocation_id) id: vec3<u32>) {
     let neighbor_avg = 0.25 * (l + r + b + t);
 
     let kappa = clamp(params.dye_diffusion, 0.0, 0.5);
-    let diffused = mix(clamped, neighbor_avg, kappa) * params.dye_dissipation;
+    let retention = effective_dye_retention(uv);
+    let diffused = mix(clamped, neighbor_avg, kappa) * retention;
 
     textureStore(field_out, coords, diffused);
 }

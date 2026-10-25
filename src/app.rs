@@ -533,10 +533,20 @@ impl AppState {
                             }
                         });
                         ui.horizontal(|ui| {
+                            if self.scenario_mode == ScenarioMode::Guinness
+                                && ui
+                                    .button("🍺 Re-Pour Pint")
+                                    .on_hover_text(
+                                        "Pour a fresh pint of Guinness filled with nitrogen micro-bubbles to watch the Boycott cascade and settling cycle from the beginning.",
+                                    )
+                                    .clicked()
+                            {
+                                requested_scenario = Some(ScenarioMode::Guinness);
+                            }
                             if ui
                                 .button("Clear Fluid")
                                 .on_hover_text(
-                                    "Reset velocity, dye, pressure, and divergence textures to zero (keeps rocks).",
+                                    "Reset velocity, dye, pressure, and divergence textures to zero (keeps rocks/glass).",
                                 )
                                 .clicked()
                             {

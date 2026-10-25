@@ -65,27 +65,39 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let dx = uv.x - 0.5;
         let r_norm = abs(dx) / max(half_w, 1e-4);
 
-        if uv.y > 0.11 && uv.y < 0.91 && r_norm < 0.98 {
+        // Inside the top foam head (`uv.y <= 0.145`), bubbles have floated to the surface and
+        // locked into a stable creamy head, so velocity damps out rapidly there.
+        if uv.y <= 0.145 {
+            vel *= 0.92;
+            textureStore(vel_out, coords, vec4<f32>(vel, 0.0, 1.0));
+            return;
+        }
+
+        if uv.y > 0.145 && uv.y < 0.91 && r_norm < 0.98 {
             let bubbles = dye.a;
-            // Core vs. slanted-wall buoyancy profile:
-            // - Center core (`r_norm < 0.64`): upward lift proportional to bubble density ($\beta$).
-            // - Outer slanted glass wall (`r_norm > 0.66`): downward Boycott sinking force ($\alpha$)
-            //   where rising bubbles pull away from the outward-sloping glass wall.
-            let core_lift = smoothstep(0.72, 0.30, r_norm) * bubbles * params.buoyancy_beta * 28.0;
-            let wall_sink = smoothstep(0.58, 0.88, r_norm) * (1.0 - smoothstep(0.94, 1.0, r_norm))
-                * params.buoyancy_alpha * 34.0;
+            // Sample the bubble concentration on the central axis `(0.5, uv.y)` at this height.
+            // Why? The Boycott effect is driven by the horizontal density contrast between the
+            // bubble-rich core and the bubble-depleted slanted wall! Once all bubbles at height `uv.y`
+            // have risen into the foam head (`core_bubbles -> 0`), both `core_lift` and `wall_sink`
+            // naturally vanish and the pint settles to rest!
+            let core_bubbles = bilerp(dye_in, vec2<f32>(0.5, uv.y), params.dye_size).a;
+            let active_surge = clamp(max(bubbles, core_bubbles), 0.0, 1.2);
+
+            let core_lift = smoothstep(0.70, 0.28, r_norm) * bubbles * params.buoyancy_beta * 28.0;
+            let wall_sink = smoothstep(0.56, 0.86, r_norm) * (1.0 - smoothstep(0.94, 1.0, r_norm))
+                * active_surge * params.buoyancy_alpha * 34.0;
 
             // Vertical Boussinesq acceleration (negative Y = upward, positive Y = downward).
             let fy = wall_sink - core_lift;
             vel.y += params.dt * fy;
 
             // Follow the outward slant of the pint glass along the descending wall boundary layer,
-            // plus a gentle Kelvin-Helmholtz wave perturbation along the shear interface (`r_norm ~ 0.68`)
-            // that triggers the characteristic cascading horizontal ripple bands!
+            // plus a Kelvin-Helmholtz wave perturbation along the shear interface (`r_norm ~ 0.68`)
+            // that triggers the characteristic cascading horizontal ripple bands while settling!
             let wall_sign = sign(dx);
             let glass_slope = -0.14 * wall_sign * smoothstep(0.60, 0.90, r_norm);
             let shear_zone = smoothstep(0.45, 0.68, r_norm) * (1.0 - smoothstep(0.68, 0.92, r_norm));
-            let wave_ripple = sin(uv.y * 38.0 - bubbles * 9.0) * shear_zone * params.buoyancy_alpha * 6.5;
+            let wave_ripple = sin(uv.y * 38.0 - bubbles * 9.0) * shear_zone * active_surge * params.buoyancy_alpha * 6.5;
             vel.x += params.dt * (glass_slope * wall_sink + wave_ripple * wall_sign);
         }
     } else {

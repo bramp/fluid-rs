@@ -123,9 +123,9 @@ pub fn apply_scenario(
         }
         ScenarioMode::Guinness => {
             params.vorticity_strength = 16.0;
-            params.velocity_dissipation = 0.994;
-            params.dye_dissipation = 0.9988;
-            params.dye_diffusion = 0.015;
+            params.velocity_dissipation = 0.992;
+            params.dye_dissipation = 0.9982;
+            params.dye_diffusion = 0.012;
             params.inflow_velocity = 0.0;
             params.buoyancy_alpha = 1.65;
             params.buoyancy_beta = 2.40;
@@ -326,11 +326,14 @@ fn upload_guinness_pint_glass_and_initial_state(
             if (0.065..=0.92).contains(&v) && abs_dx <= half_w {
                 let r_norm = abs_dx / half_w.max(1e-4);
                 let wave = 0.5 + 0.5 * (v * 42.0 + r_norm * 8.0).sin();
-                let core_bubbles = (1.0 - 0.35 * smoothstep(0.65, 0.98, r_norm))
-                    * (0.45 + 0.35 * wave)
-                    * smoothstep(0.92, 0.78, v);
-                let head_foam = smoothstep(0.16, 0.09, v) * 0.95;
-                let b_density = core_bubbles.max(head_foam);
+                // Freshly poured pint: rich cloud of suspended nitrogen micro-bubbles throughout
+                // the glass (`v in [0.14, 0.91]`) that will cascade and rise into the foam head
+                // over ~15-20 seconds until the stout body settles to deep ruby-black.
+                let body_bubbles = (1.0 - 0.25 * smoothstep(0.70, 0.98, r_norm))
+                    * (0.65 + 0.35 * wave)
+                    * smoothstep(0.92, 0.85, v);
+                let head_foam = smoothstep(0.15, 0.09, v) * 0.98;
+                let b_density = body_bubbles.max(head_foam);
                 dye_pixels[(y * dye_w + x) as usize] = [
                     0.78 * b_density,
                     0.56 * b_density,
