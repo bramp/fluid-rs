@@ -39,15 +39,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    // In RiverRocks mode (`scenario_mode == 1`), preserve fixed left inlet velocity (`coords.x < 4`),
-    // while allowing full pressure projection right up to the right outlet (`coords.x == dims.x - 1`)
-    // so eddies exit the right edge cleanly without building up un-projected divergence back-pressure!
-    if params.scenario_mode == 1u && coords.x < 4 {
-        let inflow = textureLoad(vel_in, coords, 0);
-        textureStore(vel_out, coords, inflow);
-        return;
-    }
-
     let c_left   = clamp_coords(coords - vec2<i32>(1, 0), params.sim_size);
     let c_right  = clamp_coords(coords + vec2<i32>(1, 0), params.sim_size);
     let c_bottom = clamp_coords(coords - vec2<i32>(0, 1), params.sim_size);
@@ -59,16 +50,29 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let obs_t = is_obstacle_solid(textureLoad(obs_in, c_top, 0));
 
     let p_center = textureLoad(pressure_in, coords, 0).x;
-    let p_left   = select(textureLoad(pressure_in, c_left, 0).x, p_center, obs_l);
-    let p_right  = select(textureLoad(pressure_in, c_right, 0).x, p_center, obs_r);
+    var p_left   = select(textureLoad(pressure_in, c_left, 0).x, p_center, obs_l);
+    var p_right  = select(textureLoad(pressure_in, c_right, 0).x, p_center, obs_r);
     let p_bottom = select(textureLoad(pressure_in, c_bottom, 0).x, p_center, obs_b);
     let p_top    = select(textureLoad(pressure_in, c_top, 0).x, p_center, obs_t);
+
+    // At the open left/right reservoir ghost cells (`x = -1` and `x = W`) in RiverRocks mode,
+    // use the external reservoir pressure (`p_head` at x = -1, `0.0` at x = W) so every cell
+    // `x in [0, W-1]` feels the exact central-difference pressure gradient.
+    if params.scenario_mode == 1u {
+        if coords.x == 0 {
+            let drag = max(1.0 - params.velocity_dissipation, 0.002);
+            p_left = drag * params.inflow_velocity * params.sim_size.x;
+        }
+        if coords.x == dims.x - 1 {
+            p_right = 0.0;
+        }
+    }
 
     let grad_p = 0.5 * vec2<f32>(p_right - p_left, p_top - p_bottom);
     var vel = textureLoad(vel_in, coords, 0).xy - grad_p;
 
     // Enforce no-penetration/no-slip on velocity components immediately adjacent to a solid obstacle.
-    if obs_l || obs_r {
+    if (coords.x > 0 && obs_l) || (coords.x < dims.x - 1 && obs_r) {
         vel.x = 0.0;
     }
     if obs_b || obs_t {

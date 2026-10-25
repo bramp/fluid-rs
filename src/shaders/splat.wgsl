@@ -74,25 +74,10 @@ fn splat_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
     var vel = textureLoad(vel_in, coords, 0);
     let uv = texel_to_uv(coords, params.inv_sim_size);
 
-    // Scenario 1 (River with Rocks):
-    // 1. Enforce continuous horizontal laminar inflow along the left inlet (`id.x < 8u`).
-    // 2. Enforce matched horizontal outflow sink along the right outlet (`id.x >= dims.x - 4u`,
-    //    preserving vertical velocity `vel.y` so vortex streets convect freely off-screen!).
-    // 3. Apply a gentle streamwise pressure-gradient acceleration across the open channel so
-    //    viscous drag from boulders never stalls the downstream half of the river.
-    if params.scenario_mode == 1u {
-        let wall_profile = smoothstep(0.02, 0.10, uv.y) * (1.0 - smoothstep(0.90, 0.98, uv.y));
-        let target_u = params.inflow_velocity * wall_profile;
-        if id.x < 8u {
-            vel = vec4<f32>(target_u, 0.0, 0.0, 1.0);
-        } else if id.x >= dims.x - 4u {
-            vel = vec4<f32>(target_u, vel.y, 0.0, 1.0);
-        } else {
-            // Subtle channel slope acceleration keeping the mean river current moving steadily right.
-            vel.x += params.dt * (target_u - vel.x) * 0.45;
-        }
-    }
-
+    // Note: In `RiverRocks` mode (`scenario_mode == 1`), the river current is driven physically by
+    // the hydrostatic pressure drop between $p(0) = P_{\text{head}}$ and $p(W-1) = 0$ in `jacobi.wgsl`
+    // and `project.wgsl` rather than hard-overwriting `vel` here. That way, if the user builds a dam
+    // across the river, back-pressure builds up and naturally stops new flow from entering!
     if params.splat_active != 0u && params.obstacle_brush_mode == 0u {
         let aspect = params.sim_size.x * params.inv_sim_size.y;
         let weight = gaussian_splat(uv, params.splat_pos, params.splat_radius, aspect);
@@ -114,27 +99,32 @@ fn splat_dye(@builtin(global_invocation_id) id: vec3<u32>) {
     let uv = texel_to_uv(coords, params.inv_dye_size);
     var dye = textureLoad(dye_in, coords, 0);
 
-    // Scenario 1 (River with Rocks): Inject 7 parallel laminar dye ribbons along the left inlet
-    // so streamlines parting around boulders and shedding into von Kármán vortex streets are
-    // immediately visible!
+    // Scenario 1 (River with Rocks): Inject 7 parallel laminar dye ribbons along the left inlet,
+    // gated by the actual forward inflow velocity `local_vel.x` so if a dam blocks the river and
+    // back-pressure stops the inlet flow, new dye stops entering too!
     if params.scenario_mode == 1u && uv.x < 0.018 {
-        let band_coord = uv.y * 9.0;
-        let band_idx = i32(floor(band_coord));
-        let band_frac = fract(band_coord);
-        // Smooth ribbon profile inside each band (leaving dark water gaps between bands).
-        let profile = smoothstep(0.18, 0.32, band_frac) * (1.0 - smoothstep(0.68, 0.82, band_frac));
+        let local_u = bilerp(vel_in, uv, params.sim_size).x;
+        let flow_gate = clamp(local_u / max(params.inflow_velocity * 0.5, 1.0), 0.0, 1.0);
 
-        if band_idx >= 1 && band_idx <= 7 {
-            var stream_col = vec3<f32>(0.15, 0.78, 0.92);
-            if (band_idx & 1) == 0 {
-                stream_col = vec3<f32>(0.96, 0.62, 0.22);
+        if flow_gate > 0.01 {
+            let band_coord = uv.y * 9.0;
+            let band_idx = i32(floor(band_coord));
+            let band_frac = fract(band_coord);
+            // Smooth ribbon profile inside each band (leaving dark water gaps between bands).
+            let profile = smoothstep(0.18, 0.32, band_frac) * (1.0 - smoothstep(0.68, 0.82, band_frac));
+
+            var target_dye = vec4<f32>(0.0);
+            if band_idx >= 1 && band_idx <= 7 {
+                var stream_col = vec3<f32>(0.15, 0.78, 0.92);
+                if (band_idx & 1) == 0 {
+                    stream_col = vec3<f32>(0.96, 0.62, 0.22);
+                }
+                if band_idx == 4 {
+                    stream_col = vec3<f32>(0.25, 0.92, 0.62);
+                }
+                target_dye = vec4<f32>(stream_col * profile * 1.15, 1.0);
             }
-            if band_idx == 4 {
-                stream_col = vec3<f32>(0.25, 0.92, 0.62);
-            }
-            dye = vec4<f32>(stream_col * profile * 1.15, 1.0);
-        } else {
-            dye = vec4<f32>(0.0);
+            dye = mix(dye, target_dye, flow_gate * 0.35);
         }
     }
 

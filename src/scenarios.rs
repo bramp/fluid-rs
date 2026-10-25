@@ -53,6 +53,7 @@ pub fn apply_scenario(
     scenario: ScenarioMode,
     params: &mut SimParams,
     velocity: &PingPongTexture,
+    pressure: &PingPongTexture,
     obstacles: &PingPongTexture,
     queue: &wgpu::Queue,
 ) -> DisplayMode {
@@ -73,7 +74,7 @@ pub fn apply_scenario(
             // Moderate vorticity and low velocity damping sustain a long, rhythmic
             // von Kármán vortex street downstream of each boulder.
             params.vorticity_strength = 18.0;
-            params.velocity_dissipation = 0.9995;
+            params.velocity_dissipation = 0.995;
             params.dye_dissipation = 0.9995;
             params.dye_diffusion = 0.008;
             params.inflow_velocity = 135.0;
@@ -94,33 +95,39 @@ pub fn apply_scenario(
                     radius: 0.058,
                 },
             ];
-            upload_rocks_and_initial_river_velocity(
+            let drag = (1.0 - params.velocity_dissipation).max(0.002);
+            let p_head = drag * params.inflow_velocity * params.sim_size[0];
+            upload_rocks_and_initial_river_state(
                 velocity,
+                pressure,
                 obstacles,
                 queue,
                 &rocks,
                 params.inflow_velocity,
+                p_head,
             );
             DisplayMode::RawDye
         }
     }
 }
 
-/// Rasterizes circular boulders into `obstacles` and initializes `velocity` to a uniform
-/// horizontal freestream flow outside the boulders so the river flows across the entire
-/// channel immediately from Frame 0.
-fn upload_rocks_and_initial_river_velocity(
+/// Rasterizes circular boulders into `obstacles` and initializes `velocity` and `pressure`
+/// to the steady-state pressure-driven channel flow ($p(x) = P_{\text{head}}(1 - x/W)$).
+fn upload_rocks_and_initial_river_state(
     velocity: &PingPongTexture,
+    pressure: &PingPongTexture,
     obstacles: &PingPongTexture,
     queue: &wgpu::Queue,
     rocks: &[CircularRock],
     inflow_velocity: f32,
+    p_head: f32,
 ) {
     let w = obstacles.width;
     let h = obstacles.height;
     let aspect = w as f32 / h.max(1) as f32;
     let mut obs_pixels = vec![[0.0f32; 4]; (w * h) as usize];
     let mut vel_pixels = vec![[0.0f32; 4]; (w * h) as usize];
+    let mut p_pixels = vec![[0.0f32; 4]; (w * h) as usize];
 
     for y in 0..h {
         let v = (y as f32 + 0.5) / h as f32;
@@ -150,54 +157,38 @@ fn upload_rocks_and_initial_river_velocity(
 
             if !inside_rock {
                 vel_pixels[idx] = [inflow_velocity * wall_taper, 0.0, 0.0, 1.0];
+                let p_linear = p_head * (1.0 - (x as f32 / (w.saturating_sub(1).max(1) as f32)));
+                p_pixels[idx] = [p_linear, 0.0, 0.0, 1.0];
             }
         }
     }
 
-    let obs_bytes: &[u8] = bytemuck::cast_slice(&obs_pixels);
-    for tex in [&obstacles.read.texture, &obstacles.write.texture] {
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            obs_bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 16),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
-
-    let vel_bytes: &[u8] = bytemuck::cast_slice(&vel_pixels);
-    for tex in [&velocity.read.texture, &velocity.write.texture] {
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            vel_bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 16),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
+    for (ping_pong, data) in [
+        (obstacles, bytemuck::cast_slice::<[f32; 4], u8>(&obs_pixels)),
+        (velocity, bytemuck::cast_slice::<[f32; 4], u8>(&vel_pixels)),
+        (pressure, bytemuck::cast_slice::<[f32; 4], u8>(&p_pixels)),
+    ] {
+        for tex in [&ping_pong.read.texture, &ping_pong.write.texture] {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 16),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
     }
 }
 

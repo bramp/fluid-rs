@@ -31,9 +31,21 @@
 @group(0) @binding(3) var pressure_out: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(4) var obs_in: texture_2d<f32>;
 
-// Samples pressure at `neighbor_coords`, substituting `p_center` if the neighbor is a solid obstacle
-// to enforce the homogeneous Neumann boundary condition ($\partial p / \partial \mathbf{n} = 0$).
-fn sample_pressure_neumann(neighbor_coords: vec2<i32>, p_center: f32) -> f32 {
+// Samples pressure at `neighbor_coords`, enforcing:
+// - Dirichlet reservoir pressure head ($P_{\text{head}}$ at $x = -1$, $0$ at $x = W$) in `RiverRocks` mode,
+// - Homogeneous Neumann boundary condition ($\partial p / \partial \mathbf{n} = 0$, returning `p_center`)
+//   at solid obstacles and closed box walls.
+fn sample_pressure_boundary(neighbor_coords: vec2<i32>, p_center: f32) -> f32 {
+    let dims = vec2<i32>(params.sim_size);
+    if params.scenario_mode == 1u {
+        if neighbor_coords.x < 0 {
+            let drag = max(1.0 - params.velocity_dissipation, 0.002);
+            return drag * params.inflow_velocity * params.sim_size.x;
+        }
+        if neighbor_coords.x >= dims.x {
+            return 0.0;
+        }
+    }
     let clamped = clamp_coords(neighbor_coords, params.sim_size);
     if is_obstacle_solid(textureLoad(obs_in, clamped, 0)) {
         return p_center;
@@ -49,19 +61,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    // Solid obstacle cells and the right river outflow plane (`x == dims.x - 1`) maintain zero gauge pressure.
-    if is_obstacle_solid(textureLoad(obs_in, coords, 0))
-        || (params.scenario_mode == 1u && coords.x == dims.x - 1)
-    {
+    if is_obstacle_solid(textureLoad(obs_in, coords, 0)) {
         textureStore(pressure_out, coords, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         return;
     }
 
     let p_center = textureLoad(pressure_in, coords, 0).x;
-    let p_left   = sample_pressure_neumann(coords - vec2<i32>(1, 0), p_center);
-    let p_right  = sample_pressure_neumann(coords + vec2<i32>(1, 0), p_center);
-    let p_bottom = sample_pressure_neumann(coords - vec2<i32>(0, 1), p_center);
-    let p_top    = sample_pressure_neumann(coords + vec2<i32>(0, 1), p_center);
+    let p_left   = sample_pressure_boundary(coords - vec2<i32>(1, 0), p_center);
+    let p_right  = sample_pressure_boundary(coords + vec2<i32>(1, 0), p_center);
+    let p_bottom = sample_pressure_boundary(coords - vec2<i32>(0, 1), p_center);
+    let p_top    = sample_pressure_boundary(coords + vec2<i32>(0, 1), p_center);
 
     let div = textureLoad(div_in, coords, 0).x;
     let p_new = 0.25 * (p_left + p_right + p_bottom + p_top - div);

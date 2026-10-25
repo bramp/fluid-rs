@@ -545,6 +545,7 @@ impl AppState {
                 scen,
                 &mut self.solver.params,
                 &self.solver.velocity,
+                &self.solver.pressure,
                 &self.solver.obstacles,
                 &self.gpu.queue,
             );
