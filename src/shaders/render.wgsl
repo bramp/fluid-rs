@@ -79,9 +79,10 @@ fn shade_milk_in_coffee(uv: vec2<f32>, dye: vec4<f32>) -> vec3<f32> {
     var color = mix(espresso_dark, caramel_mid, t_caramel);
     color = mix(color, cream_white, t_cream * t_cream);
 
-    // Estimate concentration gradient $\nabla m$ for subtle 3D liquid rim lighting.
-    let dx = vec2<f32>(params.inv_dye_size.x, 0.0);
-    let dy = vec2<f32>(0.0, params.inv_dye_size.y);
+    // Estimate concentration gradient $\nabla m$ over a 2-texel span for smooth liquid rim lighting
+    // without embossing single-texel steps.
+    let dx = vec2<f32>(params.inv_dye_size.x * 2.0, 0.0);
+    let dy = vec2<f32>(0.0, params.inv_dye_size.y * 2.0);
     let m_right = max(
         textureSampleLevel(dye_tex, linear_sampler, uv + dx, 0.0).r,
         textureSampleLevel(dye_tex, linear_sampler, uv + dx, 0.0).g,
@@ -99,12 +100,12 @@ fn shade_milk_in_coffee(uv: vec2<f32>, dye: vec4<f32>) -> vec3<f32> {
         textureSampleLevel(dye_tex, linear_sampler, uv - dy, 0.0).g,
     );
 
-    let grad_m = vec2<f32>(m_right - m_left, m_top - m_bot);
-    let normal = normalize(vec3<f32>(-grad_m * 3.5, 1.0));
-    let light_dir = normalize(vec3<f32>(-0.45, -0.6, 0.66));
-    let rim_spec = pow(max(dot(normal, light_dir), 0.0), 12.0) * clamp(length(grad_m) * 2.5, 0.0, 1.0);
+    let grad_m = 0.5 * vec2<f32>(m_right - m_left, m_top - m_bot);
+    let normal = normalize(vec3<f32>(-grad_m * 1.5, 1.0));
+    let light_dir = normalize(vec3<f32>(-0.45, -0.6, 0.75));
+    let rim_spec = pow(max(dot(normal, light_dir), 0.0), 16.0) * clamp(length(grad_m) * 1.5, 0.0, 1.0);
 
-    return color + vec3<f32>(0.18, 0.14, 0.10) * rim_spec;
+    return color + vec3<f32>(0.10, 0.08, 0.05) * rim_spec;
 }
 
 @fragment

@@ -150,9 +150,9 @@ impl SimParams {
             inv_dye_size: [1.0 / dye_width as f32, 1.0 / dye_height as f32],
 
             dt: 1.0 / 60.0,
-            vorticity_strength: 15.0,
-            velocity_dissipation: 0.999,
-            dye_dissipation: 0.9995,
+            vorticity_strength: 12.0,
+            velocity_dissipation: 0.993,
+            dye_dissipation: 0.998,
 
             buoyancy_alpha: 1.0,
             buoyancy_beta: 2.5,

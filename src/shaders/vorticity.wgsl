@@ -67,12 +67,16 @@ fn apply_vorticity(@builtin(global_invocation_id) id: vec3<u32>) {
     let c_bot   = abs(textureLoad(curl_in, coords - vec2<i32>(0, 1), 0).x);
 
     // Gradient of curl magnitude $\boldsymbol{\eta} = \nabla |\omega|$ pointing toward the vortex center.
+    // Adding a soft regularization constant (`1.5`) in the denominator prevents 2-pixel grid noise
+    // (where `length(eta)` is tiny) from being normalized to a full unit vector and amplified into
+    // permanent high-frequency pixel jitter.
     let eta = 0.5 * vec2<f32>(c_right - c_left, c_top - c_bot);
-    let norm_eta = eta / (length(eta) + 1e-5);
+    let norm_eta = eta / (length(eta) + 1.5);
 
     let omega = textureLoad(curl_in, coords, 0).x;
-    // Cross product $\mathbf{N} \times (0, 0, \omega) = (N_y \omega, -N_x \omega)$
-    let force = params.vorticity_strength * vec2<f32>(norm_eta.y * omega, -norm_eta.x * omega);
+    // Cross product $\mathbf{N} \times (0, 0, \omega) = (N_y \omega, -N_x \omega)$, scaled by 0.15
+    // so vorticity confinement gently sustains coherent eddies without overpowering dissipation.
+    let force = 0.15 * params.vorticity_strength * vec2<f32>(norm_eta.y * omega, -norm_eta.x * omega);
 
     let vel = textureLoad(vel_in, coords, 0).xy + params.dt * force;
     textureStore(out_tex, coords, vec4<f32>(vel, 0.0, 1.0));

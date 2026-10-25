@@ -49,8 +49,6 @@ pub struct FluidSolver {
     pub divergence: GpuTexture,
     /// Single-buffered scalar 2D curl (vorticity $\omega = \nabla \times \mathbf{u}$) stored in `Rgba16Float`.
     pub curl: GpuTexture,
-    /// Scratch buffer for storing the predictor field $\hat{\mathbf{u}}^{n+1}$ during MacCormack velocity advection.
-    pub scratch_vel: GpuTexture,
     /// Scratch buffer for storing the predictor field $\hat{\phi}^{n+1}$ during MacCormack dye advection.
     pub scratch_dye: GpuTexture,
     /// Hardware bilinear sampler (`FilterMode::Linear`, `AddressMode::ClampToEdge`) for fractional UV lookups.
@@ -66,7 +64,7 @@ pub struct FluidSolver {
     pub enable_vorticity_confinement: bool,
     /// Toggles Velocity Self-Advection ($\mathbf{u}$ transporting $\mathbf{u}$).
     pub enable_velocity_advection: bool,
-    /// Toggles 2nd-order MacCormack error-corrected advection vs. 1st-order Semi-Lagrangian advection.
+    /// Toggles 2nd-order MacCormack error-corrected dye advection vs. 1st-order Semi-Lagrangian advection.
     pub enable_maccormack_advection: bool,
     /// Toggles Divergence, Jacobi Poisson solver, and Pressure Gradient Subtraction.
     /// Disabling this makes the fluid compressible (reproducing Milestone 2's Burgers shocks).
@@ -81,7 +79,6 @@ pub struct FluidSolver {
     advect_bind_group_layout: wgpu::BindGroupLayout,
     advect_vel_pipeline: wgpu::ComputePipeline,
     advect_dye_pipeline: wgpu::ComputePipeline,
-    maccormack_vel_pipeline: wgpu::ComputePipeline,
     maccormack_dye_pipeline: wgpu::ComputePipeline,
 
     divergence_bind_group_layout: wgpu::BindGroupLayout,
@@ -134,7 +131,6 @@ impl FluidSolver {
         let pressure = PingPongTexture::new(device, sim_width, sim_height, tex_format, "pressure");
         let divergence = GpuTexture::new(device, sim_width, sim_height, tex_format, "divergence");
         let curl = GpuTexture::new(device, sim_width, sim_height, tex_format, "curl");
-        let scratch_vel = GpuTexture::new(device, sim_width, sim_height, tex_format, "scratch_vel");
         let scratch_dye = GpuTexture::new(device, dye_width, dye_height, tex_format, "scratch_dye");
 
         // Linear sampler used when sampling between grid cells (e.g. semi-Lagrangian advection
@@ -342,16 +338,6 @@ impl FluidSolver {
                 layout: Some(&advect_pipeline_layout),
                 module: &advect_shader,
                 entry_point: Some("advect_dye"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        let maccormack_vel_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("maccormack_vel_pipeline"),
-                layout: Some(&advect_pipeline_layout),
-                module: &advect_shader,
-                entry_point: Some("maccormack_velocity"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -673,7 +659,6 @@ impl FluidSolver {
             pressure,
             divergence,
             curl,
-            scratch_vel,
             scratch_dye,
             linear_sampler,
             jacobi_iterations: 35,
@@ -689,7 +674,6 @@ impl FluidSolver {
             advect_bind_group_layout,
             advect_vel_pipeline,
             advect_dye_pipeline,
-            maccormack_vel_pipeline,
             maccormack_dye_pipeline,
             divergence_bind_group_layout,
             divergence_pipeline,
@@ -711,7 +695,6 @@ impl FluidSolver {
         self.pressure.clear(queue, 8);
         self.divergence.clear(queue, 8);
         self.curl.clear(queue, 8);
-        self.scratch_vel.clear(queue, 8);
         self.scratch_dye.clear(queue, 8);
     }
 
@@ -890,124 +873,50 @@ impl FluidSolver {
         }
 
         // Pass 3: Velocity Self-Advection (`velocity.read` advects itself into `velocity.write`).
+        // Note: We use 1st-order Semi-Lagrangian advection for the velocity grid (`512x512`) so the
+        // velocity field remains smooth and differentiable ($C^1$), preventing 1-pixel shear steps
+        // from feeding high-frequency noise into the curl/vorticity pass. MacCormack is applied on
+        // the high-resolution dye grid below.
         if self.enable_velocity_advection {
-            if self.enable_maccormack_advection {
-                // Step 3a (Predictor): Advect `velocity.read` forward into `scratch_vel` ($\hat{\mathbf{u}}^{n+1}$).
-                let pred_vel_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("pred_vel_bg"),
-                    layout: &self.advect_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.params_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::TextureView(&self.scratch_vel.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
-                        },
-                    ],
-                });
+            let advect_vel_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("advect_vel_bg"),
+                layout: &self.advect_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                    },
+                ],
+            });
 
-                // Step 3b (Corrector): Trace `scratch_vel` backward and apply clamped error correction into `velocity.write`.
-                let corr_vel_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("corr_vel_bg"),
-                    layout: &self.advect_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.params_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: wgpu::BindingResource::TextureView(&self.scratch_vel.view),
-                        },
-                    ],
-                });
-
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("maccormack_vel_pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.advect_vel_pipeline);
-                cpass.set_bind_group(0, &pred_vel_bg, &[]);
-                cpass.dispatch_workgroups(sim_wg_x, sim_wg_y, 1);
-
-                cpass.set_pipeline(&self.maccormack_vel_pipeline);
-                cpass.set_bind_group(0, &corr_vel_bg, &[]);
-                cpass.dispatch_workgroups(sim_wg_x, sim_wg_y, 1);
-            } else {
-                // 1st-Order Semi-Lagrangian velocity advection.
-                let advect_vel_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("advect_vel_bg"),
-                    layout: &self.advect_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.params_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
-                        },
-                    ],
-                });
-
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("advect_vel_pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.advect_vel_pipeline);
-                cpass.set_bind_group(0, &advect_vel_bg, &[]);
-                cpass.dispatch_workgroups(sim_wg_x, sim_wg_y, 1);
-            }
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("advect_vel_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.advect_vel_pipeline);
+            cpass.set_bind_group(0, &advect_vel_bg, &[]);
+            cpass.dispatch_workgroups(sim_wg_x, sim_wg_y, 1);
+            drop(cpass);
             self.velocity.swap();
         }
 
