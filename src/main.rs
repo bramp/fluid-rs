@@ -13,6 +13,7 @@
 mod app;
 mod gpu_context;
 mod ping_pong;
+mod scenarios;
 mod solver;
 mod uniforms;
 

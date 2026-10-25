@@ -75,6 +75,7 @@ fluid-rs/
     ├── app.rs               # Window state, mouse input, egui sidebar & platform handlers
     ├── gpu_context.rs       # wgpu Instance, Adapter, Device, Queue & Surface setup
     ├── ping_pong.rs         # Double-buffered PingPongTexture & GpuTexture wrappers
+    ├── scenarios.rs         # Preset initializers (MilkCoffee, RiverRocks) & boulder masks
     ├── uniforms.rs          # #[repr(C)] SimParams uniform buffer (16-byte aligned)
     ├── solver.rs            # FluidSolver compute/render pipelines & headless shader tests
     └── shaders/
@@ -114,5 +115,5 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 - [x] **Milestone 2**: Semi-Lagrangian Advection (`advect.wgsl`)
 - [x] **Milestone 3**: Divergence, Jacobi Pressure Solver & Projection (`divergence.wgsl`, `jacobi.wgsl`, `project.wgsl`)
 - [x] **Milestone 4**: Vorticity Confinement, MacCormack Advection & "Milk in Coffee" Aesthetics
-- [ ] **Milestone 5**: Solid Obstacles & "River with Rocks"
-- [ ] **Milestone 6**: Boussinesq Buoyancy & "The Guinness Pour"
+- [x] **Milestone 5**: Solid Obstacles & "River with Rocks"
+- [ ] **Milestone 6**: Boussinesq Buoyancy, Thermal Convection & "The Guinness Pour"

@@ -27,6 +27,7 @@
 @group(0) @binding(1) var vel_in: texture_2d<f32>;
 @group(0) @binding(2) var curl_in: texture_2d<f32>;
 @group(0) @binding(3) var out_tex: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(4) var obs_in: texture_2d<f32>;
 
 @compute @workgroup_size(8, 8, 1)
 fn compute_curl(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -36,6 +37,10 @@ fn compute_curl(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let coords = vec2<i32>(id.xy);
+    if is_obstacle_solid(textureLoad(obs_in, coords, 0)) {
+        textureStore(out_tex, coords, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
 
     let uy_right = textureLoad(vel_in, clamp_coords(coords + vec2<i32>(1, 0), params.sim_size), 0).y;
     let uy_left  = textureLoad(vel_in, clamp_coords(coords - vec2<i32>(1, 0), params.sim_size), 0).y;
@@ -54,8 +59,21 @@ fn apply_vorticity(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    // Do not inject vorticity forces directly on the outer domain boundary walls.
-    if coords.x <= 1 || coords.x >= dims.x - 2 || coords.y <= 1 || coords.y >= dims.y - 2 {
+    if is_obstacle_solid(textureLoad(obs_in, coords, 0)) {
+        textureStore(out_tex, coords, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    // Do not inject vorticity forces directly on outer domain boundary walls or within 1 texel of a solid obstacle.
+    if coords.x <= 1
+        || coords.x >= dims.x - 2
+        || coords.y <= 1
+        || coords.y >= dims.y - 2
+        || is_obstacle_solid(textureLoad(obs_in, coords + vec2<i32>(1, 0), 0))
+        || is_obstacle_solid(textureLoad(obs_in, coords - vec2<i32>(1, 0), 0))
+        || is_obstacle_solid(textureLoad(obs_in, coords + vec2<i32>(0, 1), 0))
+        || is_obstacle_solid(textureLoad(obs_in, coords - vec2<i32>(0, 1), 0))
+    {
         let boundary_vel = textureLoad(vel_in, coords, 0);
         textureStore(out_tex, coords, boundary_vel);
         return;

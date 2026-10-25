@@ -18,10 +18,28 @@
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var vel_in: texture_2d<f32>;
 @group(0) @binding(2) var div_out: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(3) var obs_in: texture_2d<f32>;
 
-// Reads velocity at `coords`, returning `(0.0, 0.0)` if `coords` is outside the simulation domain.
+// Reads velocity at `coords`, enforcing solid no-slip (`0.0`) inside obstacles and domain walls
+// (except the right outflow boundary in `RiverRocks` mode).
 fn sample_vel_no_slip(coords: vec2<i32>, size: vec2<i32>) -> vec2<f32> {
-    if coords.x < 0 || coords.x >= size.x || coords.y < 0 || coords.y >= size.y {
+    if coords.y < 0 || coords.y >= size.y {
+        return vec2<f32>(0.0);
+    }
+    if coords.x < 0 {
+        if params.scenario_mode == 1u {
+            return vec2<f32>(params.inflow_velocity, 0.0);
+        }
+        return vec2<f32>(0.0);
+    }
+    if coords.x >= size.x {
+        if params.scenario_mode == 1u {
+            // Open outflow boundary on the right edge of the river channel.
+            return textureLoad(vel_in, vec2<i32>(size.x - 1, coords.y), 0).xy;
+        }
+        return vec2<f32>(0.0);
+    }
+    if is_obstacle_solid(textureLoad(obs_in, coords, 0)) {
         return vec2<f32>(0.0);
     }
     return textureLoad(vel_in, coords, 0).xy;
@@ -32,6 +50,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let dims = vec2<i32>(params.sim_size);
     let coords = vec2<i32>(id.xy);
     if coords.x >= dims.x || coords.y >= dims.y {
+        return;
+    }
+
+    if is_obstacle_solid(textureLoad(obs_in, coords, 0)) {
+        textureStore(div_out, coords, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         return;
     }
 

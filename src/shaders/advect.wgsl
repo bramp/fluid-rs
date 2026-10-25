@@ -32,6 +32,7 @@
 @group(0) @binding(2) var source_in: texture_2d<f32>;
 @group(0) @binding(3) var field_out: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(4) var phi_hat_in: texture_2d<f32>;
+@group(0) @binding(5) var obs_in: texture_2d<f32>;
 
 // Clamps a MacCormack-corrected value `val` to the component-wise `[min, max]` of the 4 texels
 // of `tex` ($\phi^n$) surrounding the backward departure point `uv`.
@@ -61,6 +62,11 @@ fn advect_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let coords = vec2<i32>(id.xy);
+    if is_obstacle_solid(textureLoad(obs_in, coords, 0)) {
+        textureStore(field_out, coords, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
     let uv = texel_to_uv(coords, params.inv_sim_size);
     let vel = textureLoad(vel_in, coords, 0).xy;
     let prev_uv = uv - params.dt * vel * params.inv_sim_size;
@@ -82,6 +88,11 @@ fn advect_dye_predictor(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let coords = vec2<i32>(id.xy);
     let uv = texel_to_uv(coords, params.inv_dye_size);
+    if is_obstacle_solid(bilerp(obs_in, uv, params.sim_size)) {
+        textureStore(field_out, coords, vec4<f32>(0.0));
+        return;
+    }
+
     let vel = bilerp(vel_in, uv, params.sim_size).xy;
     let prev_uv = uv - params.dt * vel * params.inv_sim_size;
 
@@ -99,6 +110,11 @@ fn advect_dye(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let coords = vec2<i32>(id.xy);
     let uv = texel_to_uv(coords, params.inv_dye_size);
+    if is_obstacle_solid(bilerp(obs_in, uv, params.sim_size)) {
+        textureStore(field_out, coords, vec4<f32>(0.0));
+        return;
+    }
+
     let vel = bilerp(vel_in, uv, params.sim_size).xy;
     let prev_uv = uv - params.dt * vel * params.inv_sim_size;
 
@@ -129,6 +145,10 @@ fn maccormack_dye(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let coords = vec2<i32>(id.xy);
     let uv = texel_to_uv(coords, params.inv_dye_size);
+    if is_obstacle_solid(bilerp(obs_in, uv, params.sim_size)) {
+        textureStore(field_out, coords, vec4<f32>(0.0));
+        return;
+    }
     let vel = bilerp(vel_in, uv, params.sim_size).xy;
 
     let prev_uv = uv - params.dt * vel * params.inv_sim_size;

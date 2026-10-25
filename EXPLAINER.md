@@ -213,6 +213,18 @@ Look at what happens physically when you push the mouse to the right:
 2. $-\nabla p$ pushes fluid **outward and around** the high-pressure zone in front of your cursor and pulls fluid **inward** into the low-pressure wake behind your cursor.
 3. That circular return flow from front to back is what peels off into **two symmetrical, counter-rotating vortices**!
 
+### Solid Obstacles & Boundary Conditions ("River with Rocks")
+What happens when fluid encounters a solid rock boulder inside the domain ([`src/scenarios.rs`](./src/scenarios.rs))?
+The `obstacles` GPU texture stores `is_solid = 1.0` in its `.r` channel and the 2D surface normal $(n_x, n_y)$ + dome height in `.gba`. Three boundary conditions work together so water smoothly parts around rocks without leaking inside them:
+
+1. **No-Slip / No-Penetration Velocity (`divergence.wgsl`, `advect.wgsl`, `project.wgsl`)**:
+   Inside any solid cell (`is_obstacle_solid`), velocity is clamped to $\mathbf{u} = (0, 0)$. When [`divergence.wgsl`](./src/shaders/divergence.wgsl) measures $\nabla \cdot \mathbf{u}^*$ at a fluid cell next to a rock, any solid neighbor returns velocity $(0, 0)$.
+2. **Homogeneous Neumann Pressure Mirroring ($\frac{\partial p}{\partial \mathbf{n}} = 0$ in `jacobi.wgsl` & `project.wgsl`)**:
+   Fluid cannot accelerate *into* a solid rock wall, which means the pressure gradient normal to the rock surface must be zero: $\nabla p \cdot \mathbf{n} = 0$.
+   In [`jacobi.wgsl`](./src/shaders/jacobi.wgsl) and [`project.wgsl`](./src/shaders/project.wgsl), whenever a fluid cell $(i, j)$ samples a neighbor that is inside a rock, it substitutes **its own center pressure $p(i, j)$** for that neighbor! Because $p_{\text{rock}} - p_{\text{fluid}} = 0$, the discrete pressure gradient across the rock boundary is automatically zero.
+3. **Von Kármán Vortex Street Shedding**:
+   In the **River with Rocks** scenario, [`splat.wgsl`](./src/shaders/splat.wgsl) injects a steady horizontal current and 7 colored dye ribbons at the left inlet while [`jacobi.wgsl`](./src/shaders/jacobi.wgsl) holds the right edge at gauge pressure $p = 0$ (open outflow). As fast river water sweeps past a circular boulder, high stagnation pressure builds on the upstream face while a low-pressure wake forms behind the rock. The shear layers on the top and bottom of the boulder roll up and alternate shedding clockwise and counterclockwise eddies downstream—a classic **von Kármán vortex street**!
+
 ---
 
 ## 7. Fullscreen Procedural Rendering & "Milk in Coffee" Shading ([`src/shaders/render.wgsl`](./src/shaders/render.wgsl))
@@ -245,3 +257,7 @@ Launch the simulator (`cargo run --release`) and try these interactive experimen
 5. **Visualizing the Pressure Dipole & Jacobi Convergence**:
    - Switch **Display Mode** to **Pressure (Heatmap)** and drag the mouse to see the orange/red high-pressure front and blue low-pressure wake.
    - Switch to **Divergence (Post-Projection)**, uncheck **Warm-Start Pressure**, and lower **Jacobi Iterations** to `2` to see un-cancelled compressibility.
+6. **River with Rocks & Von Kármán Vortex Streets**:
+   - Switch **Scenario Preset** to **2. River with Rocks (Vortex Street)**. Watch the 7 colored dye streams part around the boulders and braid into alternating vortex streets!
+   - Right-click and drag anywhere in the stream (or switch **Mouse Brush** to **Paint Solid Rock**) to drop new boulders into the river and watch the flow immediately re-route around them.
+   - Uncheck **5. Solid Obstacles (No-Slip / Neumann)** under **Pipeline Stages** to watch the river pass ghost-like straight through the boulders!

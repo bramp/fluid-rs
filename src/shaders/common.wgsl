@@ -27,10 +27,15 @@ struct SimParams {
     use_f32_bilerp: u32,
 
     dye_diffusion: f32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    inflow_velocity: f32,
+    obstacle_brush_mode: u32,
+    enable_obstacles: u32,
 };
+
+// Returns `true` if `obs` texel represents a solid obstacle and obstacle boundaries are enabled.
+fn is_obstacle_solid(obs: vec4<f32>) -> bool {
+    return params.enable_obstacles != 0u && obs.x > 0.5;
+}
 
 // Converts integer texel coordinates `(i, j)` to normalized cell-center UV coordinates in `[0.0, 1.0]`.
 // Adding `0.5` samples the exact geometric center of the grid cell rather than its top-left corner.

@@ -9,6 +9,7 @@
 @group(0) @binding(3) var pressure_tex: texture_2d<f32>;
 @group(0) @binding(4) var div_tex: texture_2d<f32>;
 @group(0) @binding(5) var curl_tex: texture_2d<f32>;
+@group(0) @binding(6) var obs_tex: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -100,6 +101,25 @@ fn shade_milk_in_coffee(uv: vec2<f32>, dye: vec4<f32>) -> vec3<f32> {
     return color + vec3<f32>(0.10, 0.08, 0.05) * rim_spec;
 }
 
+// Shades a 3D wet river boulder using the normal `(obs.y, obs.z)` and dome height `obs.w`
+// stored in `obs_tex`.
+fn shade_river_rock(obs: vec4<f32>) -> vec3<f32> {
+    let n2d = obs.yz;
+    let nz = max(obs.w, 0.15);
+    let normal = normalize(vec3<f32>(n2d, nz));
+    let light_dir = normalize(vec3<f32>(-0.5, -0.55, 0.67));
+    let view_dir = vec3<f32>(0.0, 0.0, 1.0);
+    let half_vec = normalize(light_dir + view_dir);
+
+    let diff = max(dot(normal, light_dir), 0.0);
+    let spec = pow(max(dot(normal, half_vec), 0.0), 28.0);
+
+    let rock_dark = vec3<f32>(0.16, 0.18, 0.21);
+    let rock_lit  = vec3<f32>(0.44, 0.47, 0.51);
+    let rim_moss  = vec3<f32>(0.24, 0.34, 0.30) * (1.0 - obs.w);
+    return mix(rock_dark, rock_lit, diff) + rim_moss * 0.35 + vec3<f32>(0.28, 0.32, 0.35) * spec;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dye = bilerp(dye_tex, in.uv, params.dye_size);
@@ -107,6 +127,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let pressure = bilerp(pressure_tex, in.uv, params.sim_size).x;
     let div = bilerp(div_tex, in.uv, params.sim_size).x;
     let curl = bilerp(curl_tex, in.uv, params.sim_size).x;
+    let obs = bilerp(obs_tex, in.uv, params.sim_size);
 
     var color = vec3<f32>(0.0);
 
@@ -114,6 +135,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // 0: Milk in Coffee (Artistic Beer-Lambert color ramp + specular rim lighting)
         case 0u, default: {
             color = shade_milk_in_coffee(in.uv, dye);
+            if is_obstacle_solid(obs) {
+                color = mix(color, shade_river_rock(obs), smoothstep(0.3, 0.65, obs.x));
+            }
         }
         // 1: Velocity debug view (direction angle -> hue, speed -> brightness)
         case 1u: {
@@ -121,24 +145,48 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let angle = atan2(vel.y, vel.x) / (2.0 * 3.14159265) + 0.5;
             let mag = clamp(speed * 0.004, 0.0, 1.0);
             color = hsv_to_rgb(angle, 0.85, mag);
+            if is_obstacle_solid(obs) {
+                color = mix(color, vec3<f32>(0.18, 0.18, 0.22), smoothstep(0.3, 0.65, obs.x));
+            }
         }
-        // 2: Pressure field heatmap (red = high pressure ahead of stroke, blue = low pressure wake)
+        // 2: Pressure field heatmap (red = high pressure ahead of stroke/rock, blue = low pressure wake)
         case 2u: {
             color = signed_heatmap(pressure * 0.015);
+            if is_obstacle_solid(obs) {
+                color = mix(color, vec3<f32>(0.18, 0.18, 0.22), smoothstep(0.3, 0.65, obs.x));
+            }
         }
         // 3: Velocity divergence heatmap ($\nabla \cdot \mathbf{u}$)
         case 3u: {
             color = signed_heatmap(div * 0.08);
+            if is_obstacle_solid(obs) {
+                color = mix(color, vec3<f32>(0.18, 0.18, 0.22), smoothstep(0.3, 0.65, obs.x));
+            }
         }
         // 4: Curl / Vorticity heatmap ($\omega = \nabla \times \mathbf{u}$)
         case 4u: {
             color = signed_heatmap(curl * 0.06);
+            if is_obstacle_solid(obs) {
+                color = mix(color, vec3<f32>(0.18, 0.18, 0.22), smoothstep(0.3, 0.65, obs.x));
+            }
         }
-        // 5: Raw RGB Dye view
+        // 5: Raw RGB Dye / River Stream view
         case 5u: {
-            let bg = vec3<f32>(0.04, 0.035, 0.045);
+            let bg = select(vec3<f32>(0.04, 0.035, 0.045), vec3<f32>(0.02, 0.055, 0.085), params.scenario_mode == 1u);
             let mapped_dye = vec3<f32>(1.0) - exp(-dye.rgb * 1.4);
             color = bg + mapped_dye;
+            if is_obstacle_solid(obs) {
+                color = mix(color, shade_river_rock(obs), smoothstep(0.3, 0.65, obs.x));
+            }
+        }
+        // 6: Obstacles debug view (mask & 2D boundary normals)
+        case 6u: {
+            if obs.x > 0.1 {
+                let n_col = vec3<f32>(obs.y * 0.5 + 0.5, obs.z * 0.5 + 0.5, obs.w);
+                color = n_col * obs.x;
+            } else {
+                color = vec3<f32>(0.04, 0.04, 0.06);
+            }
         }
     }
 

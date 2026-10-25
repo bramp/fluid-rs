@@ -26,28 +26,32 @@ pub enum DisplayMode {
     Curl = 4,
     /// Renders the raw RGB dye pigment channels (`dye.rgb`) with exponential tonemapping.
     RawDye = 5,
+    /// Visualizes the solid obstacle mask (`obstacles.r`) and boundary surface normals (`obstacles.gb`).
+    Obstacles = 6,
 }
 
 impl DisplayMode {
     /// All available display modes for populating UI dropdowns.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Dye,
         Self::RawDye,
         Self::Velocity,
         Self::Curl,
         Self::Pressure,
         Self::Divergence,
+        Self::Obstacles,
     ];
 
     /// Returns a human-readable label for the `egui` combo box.
     pub fn label(self) -> &'static str {
         match self {
             Self::Dye => "Milk in Coffee (Artistic)",
-            Self::RawDye => "Raw Dye (RGB)",
+            Self::RawDye => "Dye / River Stream (RGB)",
             Self::Velocity => "Velocity (HSV)",
             Self::Pressure => "Pressure (Heatmap)",
             Self::Divergence => "Divergence (Post-Projection)",
             Self::Curl => "Curl / Vorticity (Heatmap)",
+            Self::Obstacles => "Obstacles (Mask & Normals)",
         }
     }
 
@@ -57,21 +61,58 @@ impl DisplayMode {
             Self::Dye => {
                 "Maps scalar milk concentration through a Beer-Lambert exponential absorption curve (espresso → golden caramel → steamed cream) with subtle gradient-based specular rim lighting."
             }
-            Self::RawDye => {
-                "Renders the raw RGB channels of the high-resolution dye texture using custom brush colors."
-            }
+            Self::RawDye => "Renders the RGB dye channels and shaded solid river boulders.",
             Self::Velocity => {
                 "Visualizes the 2D velocity vector field u = (ux, uy): direction angle maps to hue (color wheel) and speed maps to brightness."
             }
             Self::Pressure => {
-                "Visualizes scalar pressure p solved by the Jacobi Poisson pass: warm orange/red = high pressure (fluid pushing outward), cool blue = low pressure (suction wake)."
+                "Visualizes scalar pressure p solved by the Jacobi Poisson pass: warm orange/red = high pressure (stagnation point upstream of rocks), cool blue = low pressure (vortex cores in wake)."
             }
             Self::Divergence => {
                 "Visualizes velocity divergence (∇ · u) after projection. For an incompressible fluid with ~35 Jacobi iterations, this stays nearly black; lower Jacobi iterations to see un-cancelled compression (blue) and expansion (red)."
             }
             Self::Curl => {
-                "Visualizes 2D scalar vorticity ω = ∂uy/∂x - ∂ux/∂y: warm orange/red = counterclockwise spin, cool blue = clockwise spin. Vorticity Confinement amplifies these cores."
+                "Visualizes 2D scalar vorticity ω = ∂uy/∂x - ∂ux/∂y: warm orange/red = counterclockwise spin, cool blue = clockwise spin. Great for watching von Kármán vortex streets shed behind rocks!"
             }
+            Self::Obstacles => {
+                "Visualizes the solid obstacle texture: solid cells are colored by their outward 2D surface normal (red/green = nx/ny, brightness = dome height)."
+            }
+        }
+    }
+}
+
+/// Interactive left-mouse brush mode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum BrushTool {
+    /// Injects velocity impulses and dye pigment into the fluid.
+    FluidAndDye = 0,
+    /// Paints solid circular rock obstacles onto the simulation grid.
+    PaintObstacle = 1,
+    /// Erases solid obstacles back into open fluid.
+    EraseObstacle = 2,
+}
+
+impl BrushTool {
+    pub const ALL: [Self; 3] = [Self::FluidAndDye, Self::PaintObstacle, Self::EraseObstacle];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FluidAndDye => "Inject Fluid & Dye",
+            Self::PaintObstacle => "Paint Solid Rock",
+            Self::EraseObstacle => "Erase Solid Rock",
+        }
+    }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Self::FluidAndDye => {
+                "Left-dragging injects Gaussian velocity impulses and dye pigment (Right-drag always paints rocks as a shortcut)."
+            }
+            Self::PaintObstacle => {
+                "Left-dragging paints circular solid rock obstacles with 3D surface normals."
+            }
+            Self::EraseObstacle => "Left-dragging erases solid rock obstacles back to open water.",
         }
     }
 }
@@ -137,11 +178,15 @@ pub struct SimParams {
     pub use_f32_bilerp: u32,
 
     // --- 16-byte block 8 (bytes 112..128) ---
-    /// Mass-conserving Fickian Laplacian diffusion rate ($\kappa \in [0.0, 0.20]$) controlling how
+    /// Mass-conserving Fickian Laplacian diffusion rate ($\kappa \in [0.0, 0.25]$) controlling how
     /// fast milk molecules blend into neighboring coffee texels while conserving total milk mass.
     pub dye_diffusion: f32,
-    /// Explicit trailing padding so the total struct size is `8 * 16 = 128` bytes.
-    pub _padding: [u32; 3],
+    /// Horizontal laminar inflow velocity (in simulation texels/sec) injected at the left edge in `RiverRocks` mode.
+    pub inflow_velocity: f32,
+    /// Mouse interaction mode (`0`: fluid/dye brush, `1`: paint solid rock, `2`: erase solid rock).
+    pub obstacle_brush_mode: u32,
+    /// Non-zero (`1`) when solid obstacle boundary conditions are active.
+    pub enable_obstacles: u32,
 }
 
 // Compile-time check guaranteeing our Rust struct matches the 128-byte WGSL uniform layout.
@@ -175,7 +220,9 @@ impl SimParams {
             scenario_mode: 0,
             use_f32_bilerp: 1,
             dye_diffusion: 0.04,
-            _padding: [0; 3],
+            inflow_velocity: 135.0,
+            obstacle_brush_mode: 0,
+            enable_obstacles: 1,
         }
     }
 }

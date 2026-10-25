@@ -51,6 +51,8 @@ pub struct FluidSolver {
     pub curl: GpuTexture,
     /// Scratch buffer for storing the predictor field $\hat{\phi}^{n+1}$ during MacCormack dye advection.
     pub scratch_dye: GpuTexture,
+    /// Double-buffered solid obstacle mask and boundary normals (`.r` = is_solid, `.gb` = 2D normal, `.a` = dome height).
+    pub obstacles: PingPongTexture,
 
     /// Number of Jacobi Poisson relaxations per frame (typically `30..=50`).
     pub jacobi_iterations: u32,
@@ -69,8 +71,11 @@ pub struct FluidSolver {
     pub enable_pressure_projection: bool,
     /// Toggles High-Resolution Dye Advection ($\mathbf{u}$ transporting pigment).
     pub enable_dye_advection: bool,
+    /// Toggles solid obstacle boundary conditions ($\mathbf{u} = 0$, $\partial p / \partial \mathbf{n} = 0$).
+    pub enable_obstacles: bool,
 
     splat_bind_group_layout: wgpu::BindGroupLayout,
+    paint_obstacles_pipeline: wgpu::ComputePipeline,
     splat_vel_pipeline: wgpu::ComputePipeline,
     splat_dye_pipeline: wgpu::ComputePipeline,
 
@@ -134,6 +139,8 @@ impl FluidSolver {
         let divergence = GpuTexture::new(device, sim_width, sim_height, tex_format, "divergence");
         let curl = GpuTexture::new(device, sim_width, sim_height, tex_format, "curl");
         let scratch_dye = GpuTexture::new(device, dye_width, dye_height, tex_format, "scratch_dye");
+        let obstacles =
+            PingPongTexture::new(device, sim_width, sim_height, tex_format, "obstacles");
 
         // --- Splat Compute Pipelines ---
         // Injects Gaussian velocity impulses and dye pigment where the user drags the mouse.
@@ -199,6 +206,28 @@ impl FluidSolver {
                         },
                         count: None,
                     },
+                    // @binding(5): Read-only input obstacles texture (`obs_in`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // @binding(6): Write-only output obstacles storage texture (`obs_out`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: tex_format,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -207,6 +236,16 @@ impl FluidSolver {
                 label: Some("splat_pipeline_layout"),
                 bind_group_layouts: &[&splat_bind_group_layout],
                 push_constant_ranges: &[],
+            });
+
+        let paint_obstacles_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("paint_obstacles_pipeline"),
+                layout: Some(&splat_pipeline_layout),
+                module: &splat_shader,
+                entry_point: Some("paint_obstacles"),
+                compilation_options: Default::default(),
+                cache: None,
             });
 
         // Separate entrypoints because `velocity` (e.g. 512x512) and `dye` (e.g. 1024x1024)
@@ -284,6 +323,17 @@ impl FluidSolver {
                     // @binding(4): Forward-advected predictor field (`phi_hat_in`) for MacCormack correction
                     wgpu::BindGroupLayoutEntry {
                         binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // @binding(5): Solid obstacles mask (`obs_in`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: false },
@@ -387,6 +437,17 @@ impl FluidSolver {
                         },
                         count: None,
                     },
+                    // @binding(3): Solid obstacles mask (`obs_in`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -469,6 +530,17 @@ impl FluidSolver {
                             access: wgpu::StorageTextureAccess::WriteOnly,
                             format: tex_format,
                             view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    // @binding(4): Solid obstacles mask (`obs_in`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
                         },
                         count: None,
                     },
@@ -593,6 +665,17 @@ impl FluidSolver {
                         },
                         count: None,
                     },
+                    // @binding(6): Solid obstacles mask & surface normals (`obstacles.read`)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -643,6 +726,7 @@ impl FluidSolver {
             divergence,
             curl,
             scratch_dye,
+            obstacles,
             jacobi_iterations: 35,
             warm_start_pressure: true,
             enable_vorticity_confinement: true,
@@ -650,7 +734,9 @@ impl FluidSolver {
             enable_maccormack_advection: true,
             enable_pressure_projection: true,
             enable_dye_advection: true,
+            enable_obstacles: true,
             splat_bind_group_layout,
+            paint_obstacles_pipeline,
             splat_vel_pipeline,
             splat_dye_pipeline,
             advect_bind_group_layout,
@@ -670,7 +756,8 @@ impl FluidSolver {
         }
     }
 
-    /// Resets all simulation textures (`velocity`, `dye`, `pressure`, `divergence`, and `curl`) to zero.
+    /// Resets all fluid textures (`velocity`, `dye`, `pressure`, `divergence`, and `curl`) to zero,
+    /// preserving any painted or preset `obstacles`.
     pub fn clear(&self, queue: &wgpu::Queue) {
         // Rgba32Float has 4 channels * 4 bytes (f32) = 16 bytes per texel.
         self.velocity.clear(queue, 16);
@@ -679,6 +766,11 @@ impl FluidSolver {
         self.divergence.clear(queue, 16);
         self.curl.clear(queue, 16);
         self.scratch_dye.clear(queue, 16);
+    }
+
+    /// Clears all solid obstacles from the simulation grid.
+    pub fn clear_obstacles(&self, queue: &wgpu::Queue) {
+        self.obstacles.clear(queue, 16);
     }
 
     /// Reallocates the high-resolution `dye` and `scratch_dye` textures at a new resolution
@@ -710,14 +802,70 @@ impl FluidSolver {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
     ) {
+        self.params.enable_obstacles = u32::from(self.enable_obstacles);
         // Upload the updated uniform struct to the GPU before compute passes run.
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&self.params));
 
-        // Pass 1: Splat / Impulse injection (when the user drags on the canvas).
-        if self.params.splat_active != 0 {
-            // Because PingPongTexture::swap() exchanges the read/write texture views after
-            // each pass, creating the BindGroup per-dispatch ensures @binding(1)/@binding(3)
-            // always point to the current `read` texture and @binding(2)/@binding(4) to `write`.
+        let sim_wg_x = self.velocity.width.div_ceil(8);
+        let sim_wg_y = self.velocity.height.div_ceil(8);
+        let dye_wg_x = self.dye.width.div_ceil(8);
+        let dye_wg_y = self.dye.height.div_ceil(8);
+
+        // Pass 1a: Paint or erase solid obstacles if the user is dragging in obstacle brush mode.
+        if self.params.splat_active != 0 && self.params.obstacle_brush_mode != 0 {
+            let paint_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("paint_obstacles_bg"),
+                layout: &self.splat_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.dye.read.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&self.dye.write.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&self.obstacles.read.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&self.obstacles.write.view),
+                    },
+                ],
+            });
+
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("paint_obstacles_pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.paint_obstacles_pipeline);
+                cpass.set_bind_group(0, &paint_bg, &[]);
+                cpass.dispatch_workgroups(sim_wg_x, sim_wg_y, 1);
+            }
+            self.obstacles.swap();
+        }
+
+        // Pass 1b: Splat / Inflow injection.
+        // Runs whenever the user drags the fluid brush OR continuously in `RiverRocks` mode (`scenario_mode == 1`)
+        // to sustain the left-edge river inflow and dye ribbons.
+        if (self.params.splat_active != 0 && self.params.obstacle_brush_mode == 0)
+            || self.params.scenario_mode == 1
+        {
             let splat_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("splat_bg"),
                 layout: &self.splat_bind_group_layout,
@@ -742,6 +890,14 @@ impl FluidSolver {
                         binding: 4,
                         resource: wgpu::BindingResource::TextureView(&self.dye.write.view),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&self.obstacles.read.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&self.obstacles.write.view),
+                    },
                 ],
             });
 
@@ -751,34 +907,18 @@ impl FluidSolver {
                     timestamp_writes: None,
                 });
 
-                // Dispatch enough 8x8 workgroups to cover every texel in the velocity grid.
                 cpass.set_pipeline(&self.splat_vel_pipeline);
                 cpass.set_bind_group(0, &splat_bg, &[]);
-                cpass.dispatch_workgroups(
-                    self.velocity.width.div_ceil(8),
-                    self.velocity.height.div_ceil(8),
-                    1,
-                );
+                cpass.dispatch_workgroups(sim_wg_x, sim_wg_y, 1);
 
-                // Dispatch enough 8x8 workgroups to cover every texel in the high-res dye grid.
                 cpass.set_pipeline(&self.splat_dye_pipeline);
                 cpass.set_bind_group(0, &splat_bg, &[]);
-                cpass.dispatch_workgroups(
-                    self.dye.width.div_ceil(8),
-                    self.dye.height.div_ceil(8),
-                    1,
-                );
+                cpass.dispatch_workgroups(dye_wg_x, dye_wg_y, 1);
             }
 
-            // Flip read/write targets so subsequent passes see the newly splatted velocity and dye.
             self.velocity.swap();
             self.dye.swap();
         }
-
-        let sim_wg_x = self.velocity.width.div_ceil(8);
-        let sim_wg_y = self.velocity.height.div_ceil(8);
-        let dye_wg_x = self.dye.width.div_ceil(8);
-        let dye_wg_y = self.dye.height.div_ceil(8);
 
         // Pass 2: Vorticity Confinement (`compute_curl` + `apply_vorticity`).
         // Always compute `curl` if either Vorticity Confinement is enabled OR the user is viewing
@@ -804,6 +944,10 @@ impl FluidSolver {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::TextureView(&self.curl.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&self.obstacles.read.view),
                     },
                 ],
             });
@@ -839,6 +983,10 @@ impl FluidSolver {
                             binding: 3,
                             resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&self.obstacles.read.view),
+                        },
                     ],
                 });
 
@@ -856,10 +1004,6 @@ impl FluidSolver {
         }
 
         // Pass 3: Velocity Self-Advection (`velocity.read` advects itself into `velocity.write`).
-        // Note: We use 1st-order Semi-Lagrangian advection for the velocity grid (`512x512`) so the
-        // velocity field remains smooth and differentiable ($C^1$), preventing 1-pixel shear steps
-        // from feeding high-frequency noise into the curl/vorticity pass. MacCormack is applied on
-        // the high-resolution dye grid below.
         if self.enable_velocity_advection {
             let advect_vel_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("advect_vel_bg"),
@@ -885,6 +1029,10 @@ impl FluidSolver {
                         binding: 4,
                         resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&self.obstacles.read.view),
+                    },
                 ],
             });
 
@@ -905,8 +1053,6 @@ impl FluidSolver {
             self.dispatch_divergence(device, encoder, "divergence_pre_project_pass");
 
             // Pass 5: Iterative Jacobi Poisson Pressure Solver ($\nabla^2 p = \nabla \cdot \mathbf{u}^*$).
-            // When `warm_start_pressure` is false, zero `pressure.read` before starting the relaxation
-            // loop so the user can compare cold-start vs. warm-start convergence in real time.
             if !self.warm_start_pressure {
                 self.pressure.read.clear(queue, 16);
             }
@@ -931,6 +1077,10 @@ impl FluidSolver {
                         wgpu::BindGroupEntry {
                             binding: 3,
                             resource: wgpu::BindingResource::TextureView(&self.pressure.write.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&self.obstacles.read.view),
                         },
                     ],
                 });
@@ -967,6 +1117,10 @@ impl FluidSolver {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&self.obstacles.read.view),
                     },
                 ],
             });
@@ -1016,6 +1170,10 @@ impl FluidSolver {
                             binding: 4,
                             resource: wgpu::BindingResource::TextureView(&self.dye.read.view),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(&self.obstacles.read.view),
+                        },
                     ],
                 });
 
@@ -1042,6 +1200,10 @@ impl FluidSolver {
                         wgpu::BindGroupEntry {
                             binding: 4,
                             resource: wgpu::BindingResource::TextureView(&self.scratch_dye.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(&self.obstacles.read.view),
                         },
                     ],
                 });
@@ -1082,6 +1244,10 @@ impl FluidSolver {
                             binding: 4,
                             resource: wgpu::BindingResource::TextureView(&self.dye.read.view),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(&self.obstacles.read.view),
+                        },
                     ],
                 });
 
@@ -1120,6 +1286,10 @@ impl FluidSolver {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(&self.divergence.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.obstacles.read.view),
                 },
             ],
         });
@@ -1175,6 +1345,10 @@ impl FluidSolver {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::TextureView(&self.curl.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&self.obstacles.read.view),
                 },
             ],
         });
