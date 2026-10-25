@@ -11,7 +11,7 @@ egui-wgpu = "0.31"
 egui-winit = { version = "0.31", default-features = false, features = ["links"] }
 glam = { version = "0.29", features = ["bytemuck"] }
 log = "0.4"
-wgpu = "24.0"
+wgpu = "30.0"
 winit = "0.30"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
