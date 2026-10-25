@@ -28,12 +28,15 @@ pub enum DisplayMode {
     RawDye = 5,
     /// Visualizes the solid obstacle mask (`obstacles.r`) and boundary surface normals (`obstacles.gb`).
     Obstacles = 6,
+    /// Renders "The Guinness Pour" stout & cascading nitrogen foam shader.
+    Guinness = 7,
 }
 
 impl DisplayMode {
     /// All available display modes for populating UI dropdowns.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Dye,
+        Self::Guinness,
         Self::RawDye,
         Self::Velocity,
         Self::Curl,
@@ -46,6 +49,7 @@ impl DisplayMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Dye => "Milk in Coffee (Artistic)",
+            Self::Guinness => "Guinness Pour (Stout & Cascade)",
             Self::RawDye => "Dye / River Stream (RGB)",
             Self::Velocity => "Velocity (HSV)",
             Self::Pressure => "Pressure (Heatmap)",
@@ -60,6 +64,9 @@ impl DisplayMode {
         match self {
             Self::Dye => {
                 "Maps scalar milk concentration through a Beer-Lambert exponential absorption curve (espresso → golden caramel → steamed cream) with subtle gradient-based specular rim lighting."
+            }
+            Self::Guinness => {
+                "Renders a ruby-black Irish stout with golden-tan nitrogen micro-bubble waves, a creamy ivory foam head, and specular pint glass walls."
             }
             Self::RawDye => "Renders the RGB dye channels and shaded solid river boulders.",
             Self::Velocity => {
@@ -207,9 +214,9 @@ impl SimParams {
             // 1.0 = 100% of poured milk stays in the cup and mixes into the coffee!
             dye_dissipation: 1.0,
 
-            buoyancy_alpha: 1.0,
-            buoyancy_beta: 2.5,
-            ambient_density: 0.0,
+            buoyancy_alpha: 0.0,
+            buoyancy_beta: 0.0,
+            ambient_density: 0.12,
             display_mode: DisplayMode::Dye as u32,
 
             splat_pos: [0.5, 0.5],

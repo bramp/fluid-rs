@@ -359,6 +359,14 @@ impl AppState {
                         );
 
                         ui.checkbox(
+                            &mut self.solver.enable_buoyancy,
+                            "6. Boussinesq Buoyancy & Convection",
+                        )
+                        .on_hover_text(
+                            "Applies gravitational sinking (α), upward thermal/bubble lift (β), and thermal mug convection (or the Boycott effect in Guinness mode).",
+                        );
+
+                        ui.checkbox(
                             &mut self.solver.enable_maccormack_advection,
                             "MacCormack Advection (2nd-Order)",
                         )
@@ -421,6 +429,38 @@ impl AppState {
                         .on_hover_text(
                             "Per-frame mass retention multiplier (1.0 = 100% of poured milk stays in the cup and mixes into the coffee; < 1.0 = pigment slowly vanishes back to black).",
                         );
+
+                        ui.separator();
+                        ui.label("Buoyancy, Gravity & Convection");
+                        ui.add_enabled(
+                            self.solver.enable_buoyancy,
+                            egui::Slider::new(&mut self.solver.params.buoyancy_alpha, 0.0..=3.5)
+                                .text("Gravity / Sinking (α)"),
+                        )
+                        .on_hover_text(
+                            "Downward gravitational pull α: in 'Milk in Coffee', pulls dense poured milk downward; in 'The Guinness Pour', drives the downward Boycott cascade of bubble-depleted stout along the slanted glass walls.",
+                        );
+                        ui.add_enabled(
+                            self.solver.enable_buoyancy,
+                            egui::Slider::new(&mut self.solver.params.buoyancy_beta, 0.0..=4.5)
+                                .text("Thermal / Bubble Lift (β)"),
+                        )
+                        .on_hover_text(
+                            "Upward Boussinesq buoyancy lift β: in 'The Guinness Pour', lifts the nitrogen bubble-rich core upward; in 'Milk in Coffee', lifts warm plumes upward.",
+                        );
+                        if self.scenario_mode != ScenarioMode::Guinness {
+                            ui.add_enabled(
+                                self.solver.enable_buoyancy,
+                                egui::Slider::new(
+                                    &mut self.solver.params.ambient_density,
+                                    0.0..=0.8,
+                                )
+                                .text("Mug Convection"),
+                            )
+                            .on_hover_text(
+                                "Background Rayleigh-Bénard thermal circulation in a hot coffee mug (warm core rising in the center, cooler coffee sinking along the outer mug walls) so milk keeps gently folding and mixing even after you stop stirring!",
+                            );
+                        }
 
                         ui.separator();
                         ui.label("Pressure Solver (Incompressibility)");
@@ -556,6 +596,17 @@ impl AppState {
         if let Some(new_res) = requested_dye_res {
             self.solver
                 .resize_dye_grid(&self.gpu.device, &self.gpu.queue, new_res, new_res);
+            if self.scenario_mode == ScenarioMode::Guinness {
+                apply_scenario(
+                    self.scenario_mode,
+                    &mut self.solver.params,
+                    &self.solver.velocity,
+                    &self.solver.dye,
+                    &self.solver.pressure,
+                    &self.solver.obstacles,
+                    &self.gpu.queue,
+                );
+            }
         }
 
         if let Some(scen) = requested_scenario {
@@ -564,6 +615,7 @@ impl AppState {
                 scen,
                 &mut self.solver.params,
                 &self.solver.velocity,
+                &self.solver.dye,
                 &self.solver.pressure,
                 &self.solver.obstacles,
                 &self.gpu.queue,

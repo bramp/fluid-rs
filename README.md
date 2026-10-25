@@ -80,13 +80,14 @@ fluid-rs/
     ├── solver.rs            # FluidSolver compute/render pipelines & headless shader tests
     └── shaders/
         ├── common.wgsl      # Shared SimParams struct, coordinate helpers & f32 bilerp
-        ├── splat.wgsl       # Gaussian velocity & dye impulse compute shader
+        ├── splat.wgsl       # Gaussian impulse, capsule rock painting, river inflow & bubble nucleation
+        ├── buoyancy.wgsl    # Boussinesq gravity, thermal mug convection & Guinness Boycott cascade
         ├── vorticity.wgsl   # 2D scalar curl & Vorticity Confinement force shader
-        ├── advect.wgsl      # Semi-Lagrangian & 2nd-order MacCormack advection shader
+        ├── advect.wgsl      # Semi-Lagrangian, 2nd-order MacCormack, Fickian diffusion & bubble slip
         ├── divergence.wgsl  # Central-difference velocity divergence compute shader
         ├── jacobi.wgsl      # Iterative Poisson pressure solver compute shader
         ├── project.wgsl     # Pressure gradient subtraction compute shader
-        └── render.wgsl      # Fullscreen triangle, Milk in Coffee shader & debug views
+        └── render.wgsl      # Fullscreen triangle, Milk in Coffee, Guinness Pour & debug views
 ```
 
 ---
@@ -116,4 +117,4 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 - [x] **Milestone 3**: Divergence, Jacobi Pressure Solver & Projection (`divergence.wgsl`, `jacobi.wgsl`, `project.wgsl`)
 - [x] **Milestone 4**: Vorticity Confinement, MacCormack Advection & "Milk in Coffee" Aesthetics
 - [x] **Milestone 5**: Solid Obstacles & "River with Rocks"
-- [ ] **Milestone 6**: Boussinesq Buoyancy, Thermal Convection & "The Guinness Pour"
+- [x] **Milestone 6**: Boussinesq Buoyancy, Thermal Convection & "The Guinness Pour"

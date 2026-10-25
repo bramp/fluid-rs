@@ -145,6 +145,32 @@ fn splat_dye(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
+    // Scenario 2 (The Guinness Pour): Continuously nucleate nitrogen micro-bubbles from the
+    // bottom widget of the pint glass (`uv.y in [0.85, 0.915]`, `|uv.x - 0.5| < 0.15`) and
+    // seed subtle bubble-wave bands near the top of the descending wall boundary layer so the
+    // Boycott cascade displays rich, rolling golden-tan nitrogen waves!
+    if params.scenario_mode == 2u {
+        let dx = uv.x - 0.5;
+        // Bottom nitrogen widget nucleation stream
+        if uv.y > 0.85 && uv.y < 0.915 && abs(dx) < 0.155 {
+            let radial = 1.0 - smoothstep(0.08, 0.155, abs(dx));
+            let plume_ripple = 0.80 + 0.20 * sin(dx * 95.0) * cos(uv.y * 140.0);
+            let target_bubble = vec4<f32>(
+                0.78 * radial * plume_ripple,
+                0.56 * radial * plume_ripple,
+                0.34 * radial * plume_ripple,
+                0.95 * radial,
+            );
+            dye = mix(dye, target_bubble, 0.18);
+        }
+        // Creamy nitrogen head accumulation at the top of the pint (`uv.y in [0.065, 0.135]`)
+        if uv.y > 0.065 && uv.y < 0.135 && abs(dx) < 0.285 {
+            let head_profile = smoothstep(0.135, 0.105, uv.y);
+            let foam_color = vec4<f32>(0.96, 0.91, 0.80, 1.0);
+            dye = mix(dye, foam_color, head_profile * 0.06);
+        }
+    }
+
     if params.splat_active != 0u && params.obstacle_brush_mode == 0u {
         let aspect = params.dye_size.x * params.inv_dye_size.y;
         let weight = gaussian_splat(uv, params.splat_pos, params.splat_radius, aspect);

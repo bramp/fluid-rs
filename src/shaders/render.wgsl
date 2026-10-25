@@ -132,12 +132,56 @@ fn shade_river_rock(uv: vec2<f32>, obs: vec4<f32>) -> vec3<f32> {
     return mix(rock_dark, rock_lit, diff) + rim_moss * 0.4 + vec3<f32>(0.30, 0.34, 0.38) * spec;
 }
 
+// Artistic shader for "The Guinness Pour" (Milestone 6):
+// Renders the deep ruby-black stout body, golden-tan cascading nitrogen bubble waves,
+// creamy ivory foam head at the top meniscus, and specular glass rim reflections.
+fn shade_guinness_pour(uv: vec2<f32>, dye: vec4<f32>, obs: vec4<f32>) -> vec3<f32> {
+    // Outside the pint glass (`obs.x > 0.5` when in Guinness mode): render dark pub backdrop
+    // with a sleek glass edge highlight right along the glass wall (`obs.x in [0.2, 0.8]`).
+    if params.enable_obstacles != 0u && obs.x > 0.15 {
+        let bg_pub = vec3<f32>(0.025, 0.022, 0.028);
+        let glass_rim = exp(-pow((obs.x - 0.48) * 7.5, 2.0));
+        let base_foot = smoothstep(0.90, 0.94, uv.y) * smoothstep(0.24, 0.18, abs(uv.x - 0.5));
+        let glass_col = vec3<f32>(0.32, 0.34, 0.38) * glass_rim + vec3<f32>(0.12, 0.13, 0.16) * base_foot;
+        if obs.x > 0.65 {
+            return bg_pub + glass_col;
+        }
+    }
+
+    let bubble_density = clamp(max(dye.a, max(dye.r, dye.g)), 0.0, 2.0);
+
+    // Deep ruby-black stout base with subtle ruby transmission near the lower glass curves.
+    let stout_black = vec3<f32>(0.028, 0.006, 0.003);
+    let ruby_glow   = vec3<f32>(0.16, 0.022, 0.008) * smoothstep(0.55, 0.90, uv.y);
+    let tan_wave    = vec3<f32>(0.76, 0.54, 0.31);
+    let cream_head  = vec3<f32>(0.97, 0.92, 0.82);
+
+    let t_wave = 1.0 - exp(-bubble_density * 2.1);
+    let t_foam = smoothstep(0.15, 0.095, uv.y) * clamp(bubble_density * 1.3 + 0.35, 0.0, 1.0);
+
+    var liquid_col = mix(stout_black + ruby_glow, tan_wave, t_wave);
+    liquid_col = mix(liquid_col, cream_head, clamp(t_foam + smoothstep(0.85, 1.45, bubble_density) * 0.65, 0.0, 1.0));
+
+    // Subtle cylindrical glass specular sheen near the left/right pint walls.
+    if params.enable_obstacles != 0u && obs.x > 0.05 {
+        let rim_highlight = exp(-pow((obs.x - 0.45) * 7.0, 2.0));
+        let bg_pub = vec3<f32>(0.025, 0.022, 0.028);
+        let alpha = smoothstep(0.28, 0.62, obs.x);
+        liquid_col = mix(liquid_col, bg_pub, alpha) + vec3<f32>(0.28, 0.30, 0.34) * rim_highlight;
+    }
+
+    return liquid_col;
+}
+
 // Blends the shaded 3D river boulder over the fluid `color`.
 // Starts the rock visual silhouette at `obs.x = 0.25` (slightly outside the `obs.x = 0.5` physics
 // boundary) so the smooth rock edge completely covers the underlying `512x512` velocity grid staircase!
 fn composite_obstacle(uv: vec2<f32>, color: vec3<f32>, obs: vec4<f32>, shaded_rock: bool) -> vec3<f32> {
     if params.enable_obstacles == 0u || obs.x <= 0.15 {
         return color;
+    }
+    if params.scenario_mode == 2u && shaded_rock {
+        return shade_guinness_pour(uv, bilerp(dye_tex, uv, params.dye_size), obs);
     }
     let alpha = smoothstep(0.18, 0.52, obs.x);
     let rock_col = select(vec3<f32>(0.22, 0.24, 0.28), shade_river_rock(uv, obs), shaded_rock);
@@ -156,9 +200,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var color = vec3<f32>(0.0);
 
     switch params.display_mode {
-        // 0: Milk in Coffee (Artistic Beer-Lambert color ramp + specular rim lighting)
+        // 0: Artistic view (Milk in Coffee or The Guinness Pour depending on scenario, or explicit mode 7)
         case 0u, default: {
-            color = composite_obstacle(in.uv, shade_milk_in_coffee(in.uv, dye), obs, true);
+            if params.scenario_mode == 2u {
+                color = shade_guinness_pour(in.uv, dye, obs);
+            } else {
+                color = composite_obstacle(in.uv, shade_milk_in_coffee(in.uv, dye), obs, true);
+            }
         }
         // 1: Velocity debug view (direction angle -> hue, speed -> brightness)
         case 1u: {
@@ -198,6 +246,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             } else {
                 color = vec3<f32>(0.04, 0.04, 0.06);
             }
+        }
+        // 7: Explicit Guinness Stout & Nitrogen Cascade shader
+        case 7u: {
+            color = shade_guinness_pour(in.uv, dye, obs);
         }
     }
 

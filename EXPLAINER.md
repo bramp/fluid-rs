@@ -229,7 +229,33 @@ The `obstacles` GPU texture stores `is_solid = 1.0` in its `.r` channel and the 
 
 ---
 
-## 7. Fullscreen Procedural Rendering & "Milk in Coffee" Shading ([`src/shaders/render.wgsl`](./src/shaders/render.wgsl))
+## 7. Boussinesq Buoyancy, Thermal Convection & "The Guinness Pour" ([`src/shaders/buoyancy.wgsl`](./src/shaders/buoyancy.wgsl))
+
+What makes warm air rise, dense cream sink, or nitrogen bubbles in a pint of Guinness cascade *downward* along the outside of the glass?
+
+### The Boussinesq Approximation
+Even when a fluid is incompressible ($\nabla \cdot \mathbf{u} = 0$), small temperature or concentration differences create small density variations $\delta \rho$. The **Boussinesq Approximation** states that we can ignore $\delta \rho$ everywhere in the momentum equation *except* where it is multiplied by gravity $g$:
+
+$$f_y = +\alpha \, c_{\text{heavy}} - \beta \, (c_{\text{buoyant}} - c_{\text{ambient}})$$
+
+*(In screen coordinates where $y = 0$ is top and $y = 1$ is bottom, $+y$ is downward gravity $\alpha$ and $-y$ is upward buoyancy lift $\beta$.)*
+
+### Why Do Bubbles in a Pint of Guinness Sink? (The Boycott Effect)
+It seems to defy gravity: nitrogen bubbles are buoyant, yet when you watch a settling pint of Guinness (**Scenario 3: The Guinness Pour**), waves of bubbles clearly roll **downward** along the glass walls!
+The secret is the **geometry of the pint glass** combined with **two-phase slip velocity** (the **Boycott Effect**, discovered by Arthur Boycott in 1920 and proven for stout beer by Benilov, Cummins & Lee in 2012):
+
+1. **Outward-Sloping Pint Glass Walls (`pint_glass_half_width`)**:
+   A pint glass is narrower at the base ($v = 0.92$) and wider toward the top ($v = 0.22$).
+2. **Vertical Bubble Slip (`sample_dye_velocity` in [`advect.wgsl`](./src/shaders/advect.wgsl))**:
+   Tiny nitrogen micro-bubbles rise straight up relative to the liquid with terminal slip speed $u_{\text{slip}}$. Because the glass walls slant *outward*, rising bubbles move **away** from the sloped walls, leaving a thin boundary layer of **bubble-depleted (heavier) stout** right against the glass walls!
+3. **Global Circulation Loop (`buoyancy.wgsl` + `project.wgsl`)**:
+   - The **bubble-rich central core** is lighter than the surrounding liquid and surges rapidly **upward** ($-y$, driven by $\beta$).
+   - The **bubble-depleted outer wall layer** is heavier than the core and sinks **downward** ($+y$, driven by $\alpha$) along the slanted walls.
+   - Because the downward liquid speed along the walls ($+55\text{ px/s}$) is faster than the tiny upward slip speed of nitrogen micro-bubbles ($-16\text{ px/s}$), the sinking liquid **drags the visible micro-bubbles downward** (`+55 - 16 = +39 > 0`) in rolling Kelvin-Helmholtz waves, before they recirculate back up the center and collect into the creamy ivory **foam head** at the top of the glass!
+
+---
+
+## 8. Fullscreen Procedural Rendering & Artistic Shaders ([`src/shaders/render.wgsl`](./src/shaders/render.wgsl))
 
 To draw the 2D textures onto the window, we don't even allocate a vertex buffer:
 - `rpass.draw(0..3, 0..1)` invokes `vs_main` three times with `@builtin(vertex_index)` equal to `0`, `1`, and `2`.
@@ -242,7 +268,7 @@ When you pour steamed milk into dark espresso, the transition isn't a linear RGB
 
 ---
 
-## 8. Hands-On Experiments to Try in `fluid-rs`
+## 9. Hands-On Experiments to Try in `fluid-rs`
 
 Launch the simulator (`cargo run --release`) and try these interactive experiments using the left control panel:
 
@@ -259,7 +285,9 @@ Launch the simulator (`cargo run --release`) and try these interactive experimen
 5. **Visualizing the Pressure Dipole & Jacobi Convergence**:
    - Switch **Display Mode** to **Pressure (Heatmap)** and drag the mouse to see the orange/red high-pressure front and blue low-pressure wake.
    - Switch to **Divergence (Post-Projection)**, uncheck **Warm-Start Pressure**, and lower **Jacobi Iterations** to `2` to see un-cancelled compressibility.
-6. **River with Rocks & Von Kármán Vortex Streets**:
+6. **River with Rocks, Von Kármán Vortex Streets & Dam Building**:
    - Switch **Scenario Preset** to **2. River with Rocks (Vortex Street)**. Watch the 7 colored dye streams part around the boulders and braid into alternating vortex streets!
-   - Right-click and drag anywhere in the stream (or switch **Mouse Brush** to **Paint Solid Rock**) to drop new boulders into the river and watch the flow immediately re-route around them.
-   - Uncheck **5. Solid Obstacles (No-Slip / Neumann)** under **Pipeline Stages** to watch the river pass ghost-like straight through the boulders!
+   - Right-click and drag from top to bottom to build a solid stone dam across the river: watch upstream pressure build to $P_{\text{head}}$ and stop new inflow, then switch **Mouse Brush** to **Erase Solid Rock** and poke a small spillway hole in the dam!
+7. **The Guinness Pour & The Boycott Effect**:
+   - Switch **Scenario Preset** to **3. The Guinness Pour (Boycott Cascade)**. Watch golden-tan nitrogen bubble waves cascade **downward** along the slanted outer walls while a fast column of bubbles surges up the center axis into the creamy foam head!
+   - Switch **Display Mode** to **Velocity (HSV)** while in Guinness mode to clearly see the two counter-rotating toroidal convection cells inside the pint glass.

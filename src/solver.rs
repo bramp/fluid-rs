@@ -73,6 +73,8 @@ pub struct FluidSolver {
     pub enable_dye_advection: bool,
     /// Toggles solid obstacle boundary conditions ($\mathbf{u} = 0$, $\partial p / \partial \mathbf{n} = 0$).
     pub enable_obstacles: bool,
+    /// Toggles Boussinesq buoyancy, gravity, and thermal/Boycott convection (`buoyancy.wgsl`).
+    pub enable_buoyancy: bool,
 
     splat_bind_group_layout: wgpu::BindGroupLayout,
     paint_obstacles_pipeline: wgpu::ComputePipeline,
@@ -89,6 +91,7 @@ pub struct FluidSolver {
     divergence_pipeline: wgpu::ComputePipeline,
 
     pressure_project_bind_group_layout: wgpu::BindGroupLayout,
+    buoyancy_pipeline: wgpu::ComputePipeline,
     curl_pipeline: wgpu::ComputePipeline,
     vorticity_pipeline: wgpu::ComputePipeline,
     jacobi_pipeline: wgpu::ComputePipeline,
@@ -468,10 +471,15 @@ impl FluidSolver {
                 cache: None,
             });
 
-        // --- Vorticity, Jacobi Pressure Solver & Pressure Projection Pipelines ---
-        // `vorticity.wgsl`, `jacobi.wgsl`, and `project.wgsl` all take `SimParams` (@binding(0)),
-        // two sampled input textures (@binding(1), @binding(2)), and one storage output texture (@binding(3)),
-        // so they share `pressure_project_bind_group_layout`.
+        // --- Buoyancy, Vorticity, Jacobi Pressure Solver & Pressure Projection Pipelines ---
+        // `buoyancy.wgsl`, `vorticity.wgsl`, `jacobi.wgsl`, and `project.wgsl` all take `SimParams` (@binding(0)),
+        // two sampled input textures (@binding(1), @binding(2)), one storage output texture (@binding(3)),
+        // and the obstacle mask (@binding(4)), so they share `pressure_project_bind_group_layout`.
+        let buoyancy_shader = create_shader_with_common(
+            device,
+            "buoyancy_shader",
+            include_str!("shaders/buoyancy.wgsl"),
+        );
         let vorticity_shader = create_shader_with_common(
             device,
             "vorticity_shader",
@@ -553,6 +561,15 @@ impl FluidSolver {
                 bind_group_layouts: &[&pressure_project_bind_group_layout],
                 push_constant_ranges: &[],
             });
+
+        let buoyancy_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("buoyancy_pipeline"),
+            layout: Some(&pressure_project_pipeline_layout),
+            module: &buoyancy_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         let curl_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("curl_pipeline"),
@@ -735,6 +752,7 @@ impl FluidSolver {
             enable_pressure_projection: true,
             enable_dye_advection: true,
             enable_obstacles: true,
+            enable_buoyancy: true,
             splat_bind_group_layout,
             paint_obstacles_pipeline,
             splat_vel_pipeline,
@@ -747,6 +765,7 @@ impl FluidSolver {
             divergence_bind_group_layout,
             divergence_pipeline,
             pressure_project_bind_group_layout,
+            buoyancy_pipeline,
             curl_pipeline,
             vorticity_pipeline,
             jacobi_pipeline,
@@ -860,11 +879,12 @@ impl FluidSolver {
             self.obstacles.swap();
         }
 
-        // Pass 1b: Splat / Inflow injection.
-        // Runs whenever the user drags the fluid brush OR continuously in `RiverRocks` mode (`scenario_mode == 1`)
-        // to sustain the left-edge river inflow and dye ribbons.
+        // Pass 1b: Splat / Inflow / Bubble Nucleation injection.
+        // Runs whenever the user drags the fluid brush OR continuously in `RiverRocks` (`scenario_mode == 1`)
+        // and `Guinness` (`scenario_mode == 2`) modes.
         if (self.params.splat_active != 0 && self.params.obstacle_brush_mode == 0)
             || self.params.scenario_mode == 1
+            || self.params.scenario_mode == 2
         {
             let splat_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("splat_bg"),
@@ -918,6 +938,52 @@ impl FluidSolver {
 
             self.velocity.swap();
             self.dye.swap();
+        }
+
+        // Pass 1c: Boussinesq Buoyancy, Gravity & Thermal/Boycott Convection (`buoyancy.wgsl`).
+        if self.enable_buoyancy
+            && (self.params.scenario_mode == 2
+                || self.params.buoyancy_alpha.abs() > 1e-4
+                || self.params.buoyancy_beta.abs() > 1e-4
+                || self.params.ambient_density > 1e-4)
+        {
+            let buoyancy_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("buoyancy_bg"),
+                layout: &self.pressure_project_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.dye.read.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&self.obstacles.read.view),
+                    },
+                ],
+            });
+
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("buoyancy_pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.buoyancy_pipeline);
+                cpass.set_bind_group(0, &buoyancy_bg, &[]);
+                cpass.dispatch_workgroups(sim_wg_x, sim_wg_y, 1);
+            }
+            self.velocity.swap();
         }
 
         // Pass 2: Vorticity Confinement (`compute_curl` + `apply_vorticity`).

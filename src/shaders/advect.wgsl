@@ -87,6 +87,24 @@ fn obstacle_boundary_dye(tex: texture_2d<f32>, uv: vec2<f32>, coords: vec2<i32>)
     return 0.25 * (l + r + b + t);
 }
 
+// Returns the effective dye/bubble advection velocity at `uv`.
+// In `Guinness` mode (`scenario_mode == 2`), nitrogen micro-bubbles have an upward terminal
+// slip velocity $u_{\text{slip}} = (0, -16)$ texels/sec relative to the liquid:
+// - In the center of the glass (`vel.y < 0`), bubbles surge rapidly upward.
+// - Near the slanted outer glass walls where dense liquid sinks faster than $16$ texels/sec
+//   (`vel.y > +16`), the sinking liquid overpowers the upward slip (`vel.y - 16 > 0`) and drags
+//   visible waves of nitrogen bubbles DOWNWARD along the walls!
+fn sample_dye_velocity(uv: vec2<f32>) -> vec2<f32> {
+    var vel = bilerp(vel_in, uv, params.sim_size).xy;
+    if params.scenario_mode == 2u {
+        // Taper upward bubble slip to zero inside the top foam head (`uv.y < 0.12`) so bubbles
+        // collect at the top meniscus rather than escaping through the top cap.
+        let slip_mask = smoothstep(0.08, 0.15, uv.y);
+        vel.y -= 16.0 * slip_mask;
+    }
+    return vel;
+}
+
 // --- 1st-Order Semi-Lagrangian Entrypoints (also used as MacCormack Predictor step) ---
 
 @compute @workgroup_size(8, 8, 1)
@@ -128,7 +146,7 @@ fn advect_dye_predictor(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    let vel = bilerp(vel_in, uv, params.sim_size).xy;
+    let vel = sample_dye_velocity(uv);
     let prev_uv = push_uv_outside_obstacle(uv - params.dt * vel * params.inv_sim_size);
 
     let advected = bilerp(source_in, prev_uv, params.dye_size);
@@ -150,7 +168,7 @@ fn advect_dye(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    let vel = bilerp(vel_in, uv, params.sim_size).xy;
+    let vel = sample_dye_velocity(uv);
     let prev_uv = push_uv_outside_obstacle(uv - params.dt * vel * params.inv_sim_size);
 
     let advected = bilerp(source_in, prev_uv, params.dye_size);
@@ -185,7 +203,7 @@ fn maccormack_dye(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    let vel = bilerp(vel_in, uv, params.sim_size).xy;
+    let vel = sample_dye_velocity(uv);
 
     let prev_uv = push_uv_outside_obstacle(uv - params.dt * vel * params.inv_sim_size);
     let next_uv = push_uv_outside_obstacle(uv + params.dt * vel * params.inv_sim_size);
