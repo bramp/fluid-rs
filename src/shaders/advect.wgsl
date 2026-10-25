@@ -89,31 +89,35 @@ fn obstacle_boundary_dye(tex: texture_2d<f32>, uv: vec2<f32>, coords: vec2<i32>)
 
 // Returns the effective dye/bubble advection velocity at `uv`.
 // In `Guinness` mode (`scenario_mode == 2`), nitrogen micro-bubbles have an upward terminal
-// slip velocity $u_{\text{slip}} = (0, -16)$ texels/sec relative to the liquid:
+// slip velocity $u_{\text{slip}} = (0, -20)$ texels/sec relative to the liquid:
 // - In the center of the glass (`vel.y < 0`), bubbles surge rapidly upward.
-// - Near the slanted outer glass walls where dense liquid sinks faster than $16$ texels/sec
-//   (`vel.y > +16`), the sinking liquid overpowers the upward slip (`vel.y - 16 > 0`) and drags
+// - Near the slanted outer glass walls where dense liquid sinks faster than $20$ texels/sec
+//   (`vel.y > +20`), the sinking liquid overpowers the upward slip (`vel.y - 20 > 0`) and drags
 //   visible waves of nitrogen bubbles DOWNWARD along the walls!
+// - Because no new bubbles enter through the solid glass bottom (`uv.y = 0.92`), this upward
+//   slip velocity sweeps the bottom of the glass clear first, creating a rising ruby-dark
+//   clearing front that marches from the bottom of the pint up to the foam head!
 fn sample_dye_velocity(uv: vec2<f32>) -> vec2<f32> {
     var vel = bilerp(vel_in, uv, params.sim_size).xy;
     if params.scenario_mode == 2u {
-        // Taper upward bubble slip to zero inside the top foam head (`uv.y < 0.14`) so bubbles
-        // collect at the top meniscus rather than escaping through the top cap.
-        let slip_mask = smoothstep(0.09, 0.15, uv.y);
-        vel.y -= 18.0 * slip_mask;
+        let current_foam = bilerp(source_in, uv, params.dye_size).r;
+        // Taper upward bubble slip to zero inside the packed foam head (`current_foam > 0.5`)
+        // so bubbles stop at the underside of the foam head and accrete onto it!
+        let slip_mask = (1.0 - smoothstep(0.35, 0.75, current_foam)) * smoothstep(0.068, 0.095, uv.y);
+        vel.y -= 20.0 * slip_mask;
     }
     return vel;
 }
 
-// Applies scenario-aware dye retention: in `Guinness` mode (`scenario_mode == 2`), bubbles in the
-// top foam head (`uv.y < 0.145`) never dissipate (`retention = 1.0`), while suspended micro-bubbles
-// in the liquid body below gradually degas/rise into the head (`params.dye_dissipation`) so the
-// pint settles from the bottom up into clear ruby-black stout!
-fn effective_dye_retention(uv: vec2<f32>) -> f32 {
-    if params.scenario_mode == 2u {
-        return mix(1.0, params.dye_dissipation, smoothstep(0.13, 0.16, uv.y));
+// Preserves the stationary floating foam head (`dye.r`) at `coords` in Guinness mode so the
+// downward Boycott liquid cascade along the walls does not drag the top foam head back down
+// into the glass!
+fn lock_floating_foam_channel(advected_val: vec4<f32>, coords: vec2<i32>) -> vec4<f32> {
+    if params.scenario_mode != 2u {
+        return advected_val;
     }
-    return params.dye_dissipation;
+    let stationary_foam = textureLoad(source_in, coords, 0).r;
+    return vec4<f32>(stationary_foam, advected_val.g, advected_val.b, advected_val.a);
 }
 
 // --- 1st-Order Semi-Lagrangian Entrypoints (also used as MacCormack Predictor step) ---
@@ -158,9 +162,17 @@ fn advect_dye_predictor(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let vel = sample_dye_velocity(uv);
-    let prev_uv = push_uv_outside_obstacle(uv - params.dt * vel * params.inv_sim_size);
+    let raw_prev_uv = uv - params.dt * vel * params.inv_sim_size;
+    let prev_uv = push_uv_outside_obstacle(raw_prev_uv);
 
-    let advected = bilerp(source_in, prev_uv, params.dye_size);
+    var advected = lock_floating_foam_channel(bilerp(source_in, prev_uv, params.dye_size), coords);
+    // In Guinness mode, no bubbles can enter from below the solid glass floor (`raw_prev_uv.y > 0.912`),
+    // so as bubbles slip upward away from the base, clear ruby-mahogany stout rises from the bottom up!
+    if params.scenario_mode == 2u {
+        let floor_clear = smoothstep(0.918, 0.904, raw_prev_uv.y);
+        advected.a *= floor_clear;
+        advected.g *= floor_clear;
+    }
     textureStore(field_out, coords, advected);
 }
 
@@ -180,7 +192,8 @@ fn advect_dye(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let vel = sample_dye_velocity(uv);
-    let prev_uv = push_uv_outside_obstacle(uv - params.dt * vel * params.inv_sim_size);
+    let raw_prev_uv = uv - params.dt * vel * params.inv_sim_size;
+    let prev_uv = push_uv_outside_obstacle(raw_prev_uv);
 
     let advected = bilerp(source_in, prev_uv, params.dye_size);
 
@@ -193,8 +206,15 @@ fn advect_dye(@builtin(global_invocation_id) id: vec3<u32>) {
         bilerp(source_in, push_uv_outside_obstacle(prev_uv + dy), params.dye_size)
     );
     let kappa = clamp(params.dye_diffusion, 0.0, 0.5);
-    let retention = effective_dye_retention(uv);
-    let diffused = mix(advected, neighbor_avg, kappa) * retention;
+    var diffused = lock_floating_foam_channel(
+        mix(advected, neighbor_avg, kappa) * params.dye_dissipation,
+        coords,
+    );
+    if params.scenario_mode == 2u {
+        let floor_clear = smoothstep(0.918, 0.904, raw_prev_uv.y);
+        diffused.a *= floor_clear;
+        diffused.g *= floor_clear;
+    }
 
     textureStore(field_out, coords, diffused);
 }
@@ -217,7 +237,8 @@ fn maccormack_dye(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let vel = sample_dye_velocity(uv);
 
-    let prev_uv = push_uv_outside_obstacle(uv - params.dt * vel * params.inv_sim_size);
+    let raw_prev_uv = uv - params.dt * vel * params.inv_sim_size;
+    let prev_uv = push_uv_outside_obstacle(raw_prev_uv);
     let next_uv = push_uv_outside_obstacle(uv + params.dt * vel * params.inv_sim_size);
 
     let phi_n = textureLoad(source_in, coords, 0);
@@ -237,8 +258,15 @@ fn maccormack_dye(@builtin(global_invocation_id) id: vec3<u32>) {
     let neighbor_avg = 0.25 * (l + r + b + t);
 
     let kappa = clamp(params.dye_diffusion, 0.0, 0.5);
-    let retention = effective_dye_retention(uv);
-    let diffused = mix(clamped, neighbor_avg, kappa) * retention;
+    var diffused = lock_floating_foam_channel(
+        mix(clamped, neighbor_avg, kappa) * params.dye_dissipation,
+        coords,
+    );
+    if params.scenario_mode == 2u {
+        let floor_clear = smoothstep(0.918, 0.904, raw_prev_uv.y);
+        diffused.a *= floor_clear;
+        diffused.g *= floor_clear;
+    }
 
     textureStore(field_out, coords, diffused);
 }

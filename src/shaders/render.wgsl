@@ -133,41 +133,61 @@ fn shade_river_rock(uv: vec2<f32>, obs: vec4<f32>) -> vec3<f32> {
 }
 
 // Artistic shader for "The Guinness Pour" (Milestone 6):
-// Renders the deep ruby-black stout body, golden-tan cascading nitrogen bubble waves,
-// creamy ivory foam head at the top meniscus, and specular glass rim reflections.
+// Renders the two-phase stout:
+// - `dye.r`: Packed creamy ivory foam head that grows downward from the top meniscus as bubbles arrive.
+// - `dye.a`: Suspended golden-tan nitrogen micro-bubble waves cascading in the liquid.
+// - Rich backlit ruby-mahogany stout body and cylindrical 3D glass reflections so the settled
+//   pint looks warm and luminous rather than pitch black.
 fn shade_guinness_pour(uv: vec2<f32>, dye: vec4<f32>, obs: vec4<f32>) -> vec3<f32> {
-    // Outside the pint glass (`obs.x > 0.5` when in Guinness mode): render dark pub backdrop
-    // with a sleek glass edge highlight right along the glass wall (`obs.x in [0.2, 0.8]`).
+    let bg_pub = vec3<f32>(0.035, 0.030, 0.038);
+
+    // Outside the pint glass (`obs.x > 0.65`): render warm pub backdrop with thick glass base & rim.
     if params.enable_obstacles != 0u && obs.x > 0.15 {
-        let bg_pub = vec3<f32>(0.025, 0.022, 0.028);
-        let glass_rim = exp(-pow((obs.x - 0.48) * 7.5, 2.0));
+        let glass_rim = exp(-pow((obs.x - 0.48) * 7.0, 2.0));
         let base_foot = smoothstep(0.90, 0.94, uv.y) * smoothstep(0.24, 0.18, abs(uv.x - 0.5));
-        let glass_col = vec3<f32>(0.32, 0.34, 0.38) * glass_rim + vec3<f32>(0.12, 0.13, 0.16) * base_foot;
+        let glass_col = vec3<f32>(0.36, 0.38, 0.42) * glass_rim + vec3<f32>(0.16, 0.17, 0.20) * base_foot;
         if obs.x > 0.65 {
             return bg_pub + glass_col;
         }
     }
 
-    let bubble_density = clamp(max(dye.a, max(dye.r, dye.g)), 0.0, 2.0);
+    let foam_head = clamp(dye.r, 0.0, 1.0);
+    let bubble_density = clamp(dye.a, 0.0, 1.5);
 
-    // Deep ruby-black stout base with subtle ruby transmission near the lower glass curves.
-    let stout_black = vec3<f32>(0.028, 0.006, 0.003);
-    let ruby_glow   = vec3<f32>(0.16, 0.022, 0.008) * smoothstep(0.55, 0.90, uv.y);
-    let tan_wave    = vec3<f32>(0.76, 0.54, 0.31);
-    let cream_head  = vec3<f32>(0.97, 0.92, 0.82);
+    // Rich ruby-mahogany stout base: Guinness is actually a deep ruby red when backlit!
+    // We model subsurface ruby transmission through the lower/center glass plus cylindrical
+    // glass highlights so the settled pint has rich depth and contrast against the backdrop.
+    let radial_center = 1.0 - clamp(abs(uv.x - 0.5) * 3.2, 0.0, 1.0);
+    let stout_mahogany = vec3<f32>(0.075, 0.016, 0.006);
+    let ruby_backlit = vec3<f32>(0.24, 0.036, 0.010)
+        * smoothstep(0.30, 0.88, uv.y)
+        * (0.45 + 0.55 * radial_center);
+    let stout_body = stout_mahogany + ruby_backlit;
 
-    let t_wave = 1.0 - exp(-bubble_density * 2.1);
-    let t_foam = smoothstep(0.15, 0.095, uv.y) * clamp(bubble_density * 1.3 + 0.35, 0.0, 1.0);
+    // Cascading golden-tan nitrogen micro-bubble waves (`dye.a`).
+    let caramel_cascade = vec3<f32>(0.58, 0.34, 0.15);
+    let tan_wave        = vec3<f32>(0.84, 0.64, 0.39);
+    let t_caramel = 1.0 - exp(-bubble_density * 2.2);
+    let t_tan     = 1.0 - exp(-max(bubble_density - 0.22, 0.0) * 2.0);
+    var liquid_col = mix(stout_body, caramel_cascade, t_caramel);
+    liquid_col = mix(liquid_col, tan_wave, t_tan);
 
-    var liquid_col = mix(stout_black + ruby_glow, tan_wave, t_wave);
-    liquid_col = mix(liquid_col, cream_head, clamp(t_foam + smoothstep(0.85, 1.45, bubble_density) * 0.65, 0.0, 1.0));
+    // Packed creamy ivory foam head (`dye.r`) that grows downward from the top rim as bubbles arrive.
+    let cream_head = vec3<f32>(0.97, 0.92, 0.82);
+    let head_shadow = vec3<f32>(0.82, 0.72, 0.56);
+    let foam_shade = mix(head_shadow, cream_head, smoothstep(0.45, 0.85, foam_head));
+    liquid_col = mix(liquid_col, foam_shade, smoothstep(0.20, 0.65, foam_head));
 
-    // Subtle cylindrical glass specular sheen near the left/right pint walls.
+    // Cylindrical 3D pint glass highlights along the left and right glass curves.
+    let glass_spec_left  = exp(-pow((uv.x - 0.27) * 18.0, 2.0)) * 0.09;
+    let glass_spec_right = exp(-pow((uv.x - 0.74) * 22.0, 2.0)) * 0.06;
+    liquid_col += vec3<f32>(0.95, 0.90, 0.85) * (glass_spec_left + glass_spec_right);
+
+    // Anti-aliased glass wall blend.
     if params.enable_obstacles != 0u && obs.x > 0.05 {
         let rim_highlight = exp(-pow((obs.x - 0.45) * 7.0, 2.0));
-        let bg_pub = vec3<f32>(0.025, 0.022, 0.028);
         let alpha = smoothstep(0.28, 0.62, obs.x);
-        liquid_col = mix(liquid_col, bg_pub, alpha) + vec3<f32>(0.28, 0.30, 0.34) * rim_highlight;
+        liquid_col = mix(liquid_col, bg_pub, alpha) + vec3<f32>(0.32, 0.34, 0.38) * rim_highlight;
     }
 
     return liquid_col;

@@ -122,13 +122,15 @@ pub fn apply_scenario(
             DisplayMode::RawDye
         }
         ScenarioMode::Guinness => {
-            params.vorticity_strength = 16.0;
-            params.velocity_dissipation = 0.992;
-            params.dye_dissipation = 0.9982;
-            params.dye_diffusion = 0.012;
+            params.vorticity_strength = 14.0;
+            params.velocity_dissipation = 0.993;
+            // 1.0 = Bubble mass is conserved in the liquid and only leaves when absorbed
+            // into the downward-growing foam head (`dye.r`) at the top of the glass!
+            params.dye_dissipation = 1.0;
+            params.dye_diffusion = 0.010;
             params.inflow_velocity = 0.0;
-            params.buoyancy_alpha = 1.65;
-            params.buoyancy_beta = 2.40;
+            params.buoyancy_alpha = 1.75;
+            params.buoyancy_beta = 2.50;
             params.ambient_density = 0.25;
 
             upload_guinness_pint_glass_and_initial_state(velocity, dye, obstacles, queue);
@@ -311,7 +313,15 @@ fn upload_guinness_pint_glass_and_initial_state(
         }
     }
 
-    // Seed the high-resolution `dye` texture with freshly poured nitrogen bubble waves and a starter creamy head.
+    // Seed the high-resolution `dye` texture for `ScenarioMode::Guinness`:
+    // Channel layout in Guinness mode:
+    // - `dye.r`: Packed creamy foam head density ($f \in [0, 1]$). Starts as a thin 2mm collar
+    //            right at the top meniscus (`v in [0.065, 0.078]`) and grows downward over time!
+    // - `dye.g`: Dissolved nitrogen gas reservoir ($g \in [0, 1]$) that nucleates micro-bubbles
+    //            during the first ~15 seconds of the pour.
+    // - `dye.b`: Subtle wave texture variation.
+    // - `dye.a`: Suspended nitrogen micro-bubble density ($b \in [0, 1]$) that drives the Boycott
+    //            cascade and rises from the bottom up to feed the growing foam head!
     let dye_w = dye.width;
     let dye_h = dye.height;
     let mut dye_pixels = vec![[0.0f32; 4]; (dye_w * dye_h) as usize];
@@ -325,21 +335,21 @@ fn upload_guinness_pint_glass_and_initial_state(
             let abs_dx = dx.abs();
             if (0.065..=0.92).contains(&v) && abs_dx <= half_w {
                 let r_norm = abs_dx / half_w.max(1e-4);
-                let wave = 0.5 + 0.5 * (v * 42.0 + r_norm * 8.0).sin();
-                // Freshly poured pint: rich cloud of suspended nitrogen micro-bubbles throughout
-                // the glass (`v in [0.14, 0.91]`) that will cascade and rise into the foam head
-                // over ~15-20 seconds until the stout body settles to deep ruby-black.
-                let body_bubbles = (1.0 - 0.25 * smoothstep(0.70, 0.98, r_norm))
-                    * (0.65 + 0.35 * wave)
-                    * smoothstep(0.92, 0.85, v);
-                let head_foam = smoothstep(0.15, 0.09, v) * 0.98;
-                let b_density = body_bubbles.max(head_foam);
-                dye_pixels[(y * dye_w + x) as usize] = [
-                    0.78 * b_density,
-                    0.56 * b_density,
-                    0.33 * b_density,
-                    b_density,
-                ];
+                let wave = 0.5 + 0.5 * (v * 46.0 + r_norm * 9.0).sin();
+
+                // Start with only a paper-thin foam collar at the very top rim (`v < 0.080`).
+                let initial_foam_collar = smoothstep(0.082, 0.069, v);
+
+                // Fill the liquid body with freshly entrained nitrogen micro-bubbles (`dye.a`)
+                // and dissolved nitrogen gas (`dye.g`).
+                let initial_bubbles = (1.0 - 0.22 * smoothstep(0.68, 0.98, r_norm))
+                    * (0.72 + 0.28 * wave)
+                    * smoothstep(0.92, 0.86, v)
+                    * (1.0 - initial_foam_collar * 0.8);
+                let dissolved_gas = 0.90 * smoothstep(0.92, 0.78, v) * (1.0 - initial_foam_collar);
+
+                dye_pixels[(y * dye_w + x) as usize] =
+                    [initial_foam_collar, dissolved_gas, wave, initial_bubbles];
             }
         }
     }

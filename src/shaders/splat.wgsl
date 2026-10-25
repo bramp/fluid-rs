@@ -145,25 +145,85 @@ fn splat_dye(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // Scenario 2 (The Guinness Pour):
-    // Rather than injecting bubbles at the bottom forever, bubbles are seeded during the initial
-    // pour (or when clicking "Re-Pour Pint" / dragging the mouse) and rise into the creamy ivory
-    // foam head (`uv.y in [0.065, 0.145]`), where surface tension locks them into a stable head
-    // as the stout body below gradually settles to deep ruby-black!
+    // Scenario 2 (The Guinness Pour — Two-Phase Foam Growth & Dissolved Gas Nucleation):
+    // - `dye.r`: Packed creamy foam head ($f \in [0, 1]$) floating at the top of the glass.
+    // - `dye.g`: Dissolved nitrogen gas ($g \in [0, 1]$) that slowly nucleates into micro-bubbles.
+    // - `dye.a`: Suspended nitrogen micro-bubbles ($b \in [0, 1]$) circulating in the stout.
+    //
+    // How the foam head grows downward over time:
+    // Whenever rising micro-bubbles (`dye.a`) arrive just beneath existing packed foam (`foam_above > 0.5`),
+    // they coalesce into the underside of the foam layer (`dye.r` increases while `dye.a` is consumed),
+    // causing the creamy head to steadily thicken downward from `uv.y = 0.07` to `uv.y = 0.165`!
     if params.scenario_mode == 2u {
-        let dx = uv.x - 0.5;
-        if uv.y > 0.065 && uv.y < 0.145 && abs(dx) < 0.295 {
-            // Preserve and gently compact rising bubbles that reach the top foam head layer.
-            let head_band = smoothstep(0.145, 0.125, uv.y) * (1.0 - smoothstep(0.062, 0.068, uv.y));
-            let foam_target = vec4<f32>(0.96, 0.91, 0.80, 1.0);
-            dye = max(dye, foam_target * head_band * 0.92);
+        let obs = bilerp(obs_in, uv, params.sim_size);
+        if obs.x < 0.5 {
+            var foam = dye.r;
+            var gas = dye.g;
+            var bubbles = dye.a;
+
+            // 1. Dissolved nitrogen gas (`gas`) slowly nucleates into new suspended micro-bubbles (`bubbles`)
+            //    above the rising lower clearing front (`uv.y < 0.82`), sustaining the Boycott cascade
+            //    for ~20 seconds before the dissolved gas is exhausted.
+            if gas > 0.005 && foam < 0.3 {
+                let nuc_rate = 0.0035 * smoothstep(0.90, 0.65, uv.y);
+                let d_gas = gas * nuc_rate;
+                gas = max(gas - d_gas * 1.4, 0.0);
+                bubbles = min(bubbles + d_gas, 1.25);
+            }
+
+            // 2. Top meniscus seed (`uv.y in [0.065, 0.074]`): bubbles reaching the very top liquid
+            //    surface always form the initial thin surface collar.
+            if uv.y >= 0.064 && uv.y <= 0.074 && bubbles > 0.05 {
+                let seed = min(bubbles * 0.06, 0.025);
+                foam = min(foam + seed, 1.0);
+                bubbles = max(bubbles - seed, 0.0);
+            }
+
+            // 3. Downward accretion of the foam head (`uv.y in [0.070, 0.172]`):
+            //    A cell converts rising bubbles (`bubbles`) into packed foam (`foam`) ONLY when the
+            //    cell immediately above it (`coords - (0, 1)`) is already packed foam (`foam_above > 0.55`)!
+            //    This makes the foam head boundary propagate downward like a real settling front.
+            if uv.y > 0.070 && uv.y < 0.172 {
+                let above_c = clamp_coords(coords - vec2<i32>(0, 1), params.dye_size);
+                let left_c  = clamp_coords(coords - vec2<i32>(1, 0), params.dye_size);
+                let right_c = clamp_coords(coords + vec2<i32>(1, 0), params.dye_size);
+
+                let foam_above = textureLoad(dye_in, above_c, 0).r;
+                let foam_horiz = 0.5 * (textureLoad(dye_in, left_c, 0).r + textureLoad(dye_in, right_c, 0).r);
+
+                // Maximum equilibrium head depth is `uv.y ~ 0.168`.
+                let depth_cap = smoothstep(0.172, 0.152, uv.y);
+                let front_trigger = smoothstep(0.52, 0.78, foam_above) * depth_cap;
+                let accrete = min(bubbles * 0.022, 0.0045) * front_trigger;
+
+                foam = min(foam + accrete, 1.0);
+                // Horizontal surface tension keeps the bottom of the foam head level across the pint!
+                foam = mix(foam, max(foam, foam_horiz), 0.15 * front_trigger);
+                bubbles = max(bubbles - accrete * 1.1, 0.0);
+            }
+
+            // 4. Inside the packed foam head (`foam > 0.6`), trapped bubbles slowly drain into foam.
+            if foam > 0.6 {
+                let drain = min(bubbles * 0.03, 0.01);
+                foam = min(foam + drain * 0.5, 1.0);
+                bubbles = max(bubbles - drain, 0.0);
+            }
+
+            dye = vec4<f32>(foam, gas, dye.b, bubbles);
         }
     }
 
     if params.splat_active != 0u && params.obstacle_brush_mode == 0u {
         let aspect = params.dye_size.x * params.inv_dye_size.y;
         let weight = gaussian_splat(uv, params.splat_pos, params.splat_radius, aspect);
-        dye = clamp(dye + params.splat_color * weight, vec4<f32>(0.0), vec4<f32>(4.0));
+        if params.scenario_mode == 2u {
+            // In Guinness mode, dragging the mouse injects a fresh burst of nitrogen micro-bubbles (`.a`)
+            // and dissolved gas (`.g`) without painting solid foam in the middle of the glass!
+            dye.a = clamp(dye.a + weight * 0.9, 0.0, 1.5);
+            dye.g = clamp(dye.g + weight * 0.5, 0.0, 1.0);
+        } else {
+            dye = clamp(dye + params.splat_color * weight, vec4<f32>(0.0), vec4<f32>(4.0));
+        }
     }
 
     textureStore(dye_out, coords, dye);

@@ -248,10 +248,15 @@ The secret is the **geometry of the pint glass** combined with **two-phase slip 
    A pint glass is narrower at the base ($v = 0.92$) and wider toward the top ($v = 0.22$).
 2. **Vertical Bubble Slip (`sample_dye_velocity` in [`advect.wgsl`](./src/shaders/advect.wgsl))**:
    Tiny nitrogen micro-bubbles rise straight up relative to the liquid with terminal slip speed $u_{\text{slip}}$. Because the glass walls slant *outward*, rising bubbles move **away** from the sloped walls, leaving a thin boundary layer of **bubble-depleted (heavier) stout** right against the glass walls!
-3. **Global Circulation Loop (`buoyancy.wgsl` + `project.wgsl`)**:
+3. **Global Circulation Loop & Multi-Phase Foam Accretion (`buoyancy.wgsl` + `splat.wgsl` + `advect.wgsl`)**:
    - The **bubble-rich central core** is lighter than the surrounding liquid and surges rapidly **upward** ($-y$, driven by $\beta$).
    - The **bubble-depleted outer wall layer** is heavier than the core and sinks **downward** ($+y$, driven by $\alpha$) along the slanted walls.
-   - Because the downward liquid speed along the walls ($+55\text{ px/s}$) is faster than the tiny upward slip speed of nitrogen micro-bubbles ($-16\text{ px/s}$), the sinking liquid **drags the visible micro-bubbles downward** (`+55 - 16 = +39 > 0`) in rolling Kelvin-Helmholtz waves, before they recirculate back up the center and collect into the creamy ivory **foam head** at the top of the glass!
+   - Because the downward liquid speed along the walls ($+55\text{ px/s}$) is faster than the tiny upward slip speed of nitrogen micro-bubbles ($-20\text{ px/s}$), the sinking liquid **drags the visible micro-bubbles downward** (`+55 - 20 = +35 > 0`) in rolling Kelvin-Helmholtz waves!
+   - **Why the Pint Clears from the Bottom Up while the Head Grows Downward**:
+     We track three distinct phases in the `dye` texture channels:
+     1. **Dissolved Nitrogen Gas (`dye.g`)**: Slowly nucleates into new micro-bubbles (`dye.a`) during the initial surge.
+     2. **Suspended Micro-Bubbles (`dye.a`)**: Conserved (`dye_dissipation = 1.0`) while swirling and rising with upward slip velocity. Because no new bubbles can enter from below the solid glass floor (`raw_prev_uv.y > 0.91`), a **ruby-mahogany clearing front** starts at the bottom of the glass and marches steadily upward behind the rising bubble cloud.
+     3. **Floating Creamy Foam Head (`dye.r`)**: Starts as a paper-thin collar at the top rim (`uv.y = 0.07`). Whenever rising micro-bubbles (`dye.a`) hit a cell immediately beneath existing packed foam (`foam_above > 0.55`), they coalesce into the underside of the foam head (`dye.r` increases while `dye.a` is consumed)—causing the **creamy ivory head to visibly grow downward** until the rising ruby-mahogany clearing front meets it from below!
 
 ---
 
