@@ -199,6 +199,18 @@ Every frame, `FluidSolver::step(&mut self, encoder: &mut wgpu::CommandEncoder)` 
 
 ### Milestone 6: Boussinesq Buoyancy & "The Guinness Pour"
 - Procedurally generate a curved **Pint Glass** obstacle mask in `obstacles`.
-- Implement `buoyancy.wgsl` using `.a` of `dye` as `bubble_density` and `.r` as `stout_temperature`.
+- Implement `buoyancy.wgsl` using `.a` of `dye` as `bubble_density` and `.r` as `foam_head`.
 - Add a separate drift velocity term when advecting the bubble channel.
 - Add the **Guinness** artistic shader in `render.wgsl`.
+
+### Milestone 7: 2nd-Order Runge-Kutta (RK2 Midpoint) Streamline Tracing
+- Upgrade `advect.wgsl` to trace curved streamlines via RK2 midpoint evaluation ($\mathbf{x}_{\text{mid}} = \mathbf{x} - \frac{\Delta t}{2}\mathbf{u}(\mathbf{x})$, $\mathbf{x}_{\text{prev}} = \mathbf{x} - \Delta t\,\mathbf{u}(\mathbf{x}_{\text{mid}})$) with a live UI toggle to compare 1st-order Euler vs. 2nd-order RK2 around boulders and vortex cores.
+
+### Milestone 8: Navier-Stokes Kinematic Viscosity ($\nu \nabla^2 \mathbf{u}$) & Variable Foam Viscosity $\nu(\phi)$
+- Add explicit Laplacian momentum diffusion $\nu \nabla^2 \mathbf{u}$ to conserve bulk momentum while creating physical Prandtl boundary layers along rocks and pint-glass walls, plus concentration-dependent viscosity $\nu(\phi)$ so packed Guinness foam behaves as a high-viscosity cap.
+
+### Milestone 9: Red-Black Gauss-Seidel / Successive Over-Relaxation (SOR) Pressure Solver
+- Upgrade `jacobi.wgsl` with a Red-Black checkerboard Successive Over-Relaxation ($\omega \in [1.0, 1.9]$) solver that converges $5\times$–$10\times$ faster than standard Jacobi, enabling rapid global hydrostatic pressure equilibration.
+
+### Milestone 10: Conservative Finite-Volume Flux & Richardson-Zaki Hindered Settling
+- Split two-phase bubble transport into incompressible liquid advection + a strictly mass-conserving 1D/2D Finite-Volume Godunov flux pass for the Kynch / Richardson-Zaki hindered-settling flux $J(\phi) = -v_0 \phi (1 - \phi)^n$, so both the downward-growing foam head shock ($\phi \to 1$) and the rising bottom clearing shock ($\phi \to 0$) emerge from a single conservation law.

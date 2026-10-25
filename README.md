@@ -118,3 +118,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 - [x] **Milestone 4**: Vorticity Confinement, MacCormack Advection & "Milk in Coffee" Aesthetics
 - [x] **Milestone 5**: Solid Obstacles & "River with Rocks"
 - [x] **Milestone 6**: Boussinesq Buoyancy, Thermal Convection & "The Guinness Pour"
+- [ ] **Milestone 7**: 2nd-Order Runge-Kutta (RK2 Midpoint) Streamline Tracing
+- [ ] **Milestone 8**: Navier-Stokes Kinematic Viscosity ($\nu \nabla^2 \mathbf{u}$) & Non-Newtonian Foam Viscosity $\nu(\phi)$
+- [ ] **Milestone 9**: Red-Black Gauss-Seidel / Successive Over-Relaxation (SOR) Pressure Solver
+- [ ] **Milestone 10**: Conservative Finite-Volume Flux & Richardson-Zaki Hindered Settling ($J(\phi) = -v_0 \phi (1 - \phi)^n$)
