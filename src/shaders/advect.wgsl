@@ -23,6 +23,15 @@
 @group(0) @binding(3) var source_in: texture_2d<f32>;
 @group(0) @binding(4) var field_out: texture_storage_2d<rgba16float, write>;
 
+// Samples `tex` at `uv` using either 32-bit float software bilinear interpolation (`bilerp`)
+// or 8-bit hardware `textureSampleLevel` depending on the `use_f32_bilerp` UI toggle.
+fn sample_advect(tex: texture_2d<f32>, uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
+    if params.use_f32_bilerp != 0u {
+        return bilerp(tex, uv, size);
+    }
+    return textureSampleLevel(tex, linear_sampler, uv, 0.0);
+}
+
 // Self-advects the 2D velocity field (`vel_in` -> `field_out`) on the simulation grid (`sim_size`).
 @compute @workgroup_size(8, 8, 1)
 fn advect_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -40,8 +49,8 @@ fn advect_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
     // Trace backward in time: convert velocity from sim-texels/sec to UV/sec via `inv_sim_size`.
     let prev_uv = uv - params.dt * vel * params.inv_sim_size;
 
-    // Interpolate the velocity field at the departure point in full f32 precision and apply damping.
-    let advected = bilerp(source_in, prev_uv, params.sim_size).xy;
+    // Interpolate the velocity field at the departure point and apply damping.
+    let advected = sample_advect(source_in, prev_uv, params.sim_size).xy;
     let damped = advected * params.velocity_dissipation;
 
     textureStore(field_out, coords, vec4<f32>(damped, 0.0, 1.0));
@@ -59,14 +68,14 @@ fn advect_dye(@builtin(global_invocation_id) id: vec3<u32>) {
     let coords = vec2<i32>(id.xy);
     let uv = texel_to_uv(coords, params.inv_dye_size);
 
-    // Sample velocity in f32 because the dye grid (1024^2) is finer than the sim grid (512^2).
-    let vel = bilerp(vel_in, uv, params.sim_size).xy;
+    // Sample velocity because the dye grid (1024^2) is finer than the sim grid (512^2).
+    let vel = sample_advect(vel_in, uv, params.sim_size).xy;
 
     // Trace backward in UV space using `inv_sim_size` (since `vel` is in sim-grid texels/sec).
     let prev_uv = uv - params.dt * vel * params.inv_sim_size;
 
-    // Interpolate the dye concentration at the departure point in full f32 precision and apply fade.
-    let advected = bilerp(source_in, prev_uv, params.dye_size);
+    // Interpolate the dye concentration at the departure point and apply fade.
+    let advected = sample_advect(source_in, prev_uv, params.dye_size);
     let dissipated = advected * params.dye_dissipation;
 
     textureStore(field_out, coords, dissipated);

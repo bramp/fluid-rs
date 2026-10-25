@@ -26,7 +26,7 @@ const SIM_RES: u32 = 512;
 const DYE_RES: u32 = 1024;
 
 /// Width in logical points of the docked `egui` control sidebar.
-const SIDE_PANEL_WIDTH: f32 = 260.0;
+const SIDE_PANEL_WIDTH: f32 = 280.0;
 
 /// Holds the initialized GPU context, fluid solver, `egui` renderer, and interactive UI/mouse state.
 pub struct AppState {
@@ -38,6 +38,10 @@ pub struct AppState {
 
     /// Currently selected visualization mode in the UI.
     pub display_mode: DisplayMode,
+    /// Whether the simulation is currently paused (only advances when clicking "Step 1 Frame").
+    pub paused: bool,
+    /// Toggles 32-bit float software bilinear interpolation vs. 8-bit GPU hardware sampler in `advect.wgsl`.
+    pub use_f32_bilerp: bool,
     /// RGB color injected when dragging the mouse.
     pub splat_color: [f32; 3],
     /// Brush radius in normalized UV space `[0.005, 0.08]`.
@@ -97,6 +101,8 @@ impl AppState {
             egui_state,
             egui_renderer,
             display_mode: DisplayMode::Dye,
+            paused: false,
+            use_f32_bilerp: true,
             splat_color: [0.95, 0.72, 0.38],
             splat_radius: 0.025,
             splat_force: 15.0,
@@ -200,6 +206,7 @@ impl AppState {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut clear_requested = false;
+        let mut step_once_requested = false;
         let raw_input = self.egui_state.take_egui_input(&self.gpu.window);
 
         // Run the immediate-mode UI pass to collect widget state changes and tessellated UI geometry.
@@ -212,53 +219,146 @@ impl AppState {
                     ui.label("2D Eulerian Fluid Simulator");
                     ui.separator();
 
-                    ui.label("Display Mode");
+                    ui.label("Display Mode")
+                        .on_hover_text("Choose which GPU texture field to visualize on the canvas.");
                     egui::ComboBox::from_id_salt("display_mode_combo")
                         .selected_text(self.display_mode.label())
                         .show_ui(ui, |ui| {
                             for mode in DisplayMode::ALL {
-                                ui.selectable_value(&mut self.display_mode, mode, mode.label());
+                                ui.selectable_value(&mut self.display_mode, mode, mode.label())
+                                    .on_hover_text(mode.tooltip());
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text(self.display_mode.tooltip());
+
+                    ui.separator();
+                    ui.label("Pipeline Stages & Algorithms")
+                        .on_hover_text(
+                            "Enable or disable individual operator-splitting passes to see how each mathematical term shapes the fluid.",
+                        );
+
+                    ui.checkbox(
+                        &mut self.solver.enable_velocity_advection,
+                        "1. Velocity Self-Advection",
+                    )
+                    .on_hover_text(
+                        "Solves ∂u/∂t + (u · ∇)u = 0 so momentum carries itself across the grid. If disabled, velocity stays frozen at the spot where you clicked.",
+                    );
+
+                    ui.checkbox(
+                        &mut self.solver.enable_pressure_projection,
+                        "2. Pressure Projection (∇·u = 0)",
+                    )
+                    .on_hover_text(
+                        "Solves the Poisson equation ∇²p = ∇·u* and subtracts ∇p to make the fluid incompressible. Disable this to see Milestone 2's compressible Burgers shockwaves!",
+                    );
+
+                    ui.checkbox(
+                        &mut self.solver.enable_dye_advection,
+                        "3. High-Res Dye Advection",
+                    )
+                    .on_hover_text(
+                        "Transports the 1024×1024 dye pigment along the 512×512 velocity field. If disabled, you can paint dye and move velocity, but the dye won't flow.",
+                    );
+
+                    ui.checkbox(&mut self.use_f32_bilerp, "f32 Software Bilerp")
+                        .on_hover_text(
+                            "Interpolates advection lookbacks in full 32-bit float via textureLoad instead of GPU hardware 8-bit fixed-point (1/256 texel) samplers. Uncheck to observe sub-texel stair-stepping when fluid slows down.",
+                        );
 
                     ui.separator();
                     ui.label("Advection & Dissipation");
                     ui.add(
                         egui::Slider::new(&mut self.solver.params.dt, 0.001..=0.05)
                             .text("Timestep (dt)"),
+                    )
+                    .on_hover_text(
+                        "Simulation timestep Δt in seconds per frame. Larger values make the fluid move faster per frame; Semi-Lagrangian backward tracing stays stable even at high Δt.",
                     );
                     ui.add(
                         egui::Slider::new(&mut self.solver.params.velocity_dissipation, 0.95..=1.0)
                             .text("Vel Dissipation"),
+                    )
+                    .on_hover_text(
+                        "Per-frame multiplier on velocity (1.0 = no drag, < 1.0 = exponential damping that gradually brings the fluid to rest).",
                     );
                     ui.add(
                         egui::Slider::new(&mut self.solver.params.dye_dissipation, 0.95..=1.0)
                             .text("Dye Dissipation"),
+                    )
+                    .on_hover_text(
+                        "Per-frame multiplier on dye concentration (1.0 = pigment never fades, < 1.0 = dye gradually dissolves back to background).",
                     );
 
                     ui.separator();
                     ui.label("Pressure Solver (Incompressibility)");
-                    ui.add(
+                    ui.add_enabled(
+                        self.solver.enable_pressure_projection,
                         egui::Slider::new(&mut self.solver.jacobi_iterations, 0..=80)
                             .text("Jacobi Iterations"),
+                    )
+                    .on_hover_text(
+                        "Number of parallel Jacobi relaxation passes per frame to solve ∇²p = ∇·u*. ~35 iterations removes nearly all compressibility; drag down to 1–5 to see long-range pressure waves fail to propagate.",
                     );
-                    ui.checkbox(&mut self.solver.warm_start_pressure, "Warm-Start Pressure");
+                    ui.add_enabled(
+                        self.solver.enable_pressure_projection,
+                        egui::Checkbox::new(
+                            &mut self.solver.warm_start_pressure,
+                            "Warm-Start Pressure",
+                        ),
+                    )
+                    .on_hover_text(
+                        "Reuses the previous frame's pressure texture as the initial guess for Jacobi iteration instead of clearing to zero. Significantly improves convergence at low iteration counts.",
+                    );
 
                     ui.separator();
                     ui.label("Brush / Splat");
-                    ui.add(egui::Slider::new(&mut self.splat_radius, 0.005..=0.08).text("Radius"));
+                    ui.add(egui::Slider::new(&mut self.splat_radius, 0.005..=0.08).text("Radius"))
+                        .on_hover_text(
+                            "Gaussian standard deviation (radius) of the mouse brush in normalized canvas UV units.",
+                        );
                     ui.add(
                         egui::Slider::new(&mut self.splat_force, 1.0..=50.0).text("Impulse Force"),
+                    )
+                    .on_hover_text(
+                        "Multiplier converting cursor drag speed into fluid velocity impulse (in simulation grid texels per second).",
                     );
                     ui.horizontal(|ui| {
                         ui.label("Dye Color");
-                        ui.color_edit_button_rgb(&mut self.splat_color);
+                        ui.color_edit_button_rgb(&mut self.splat_color)
+                            .on_hover_text("RGB pigment color injected when dragging the mouse.");
                     });
 
                     ui.separator();
-                    if ui.button("Clear Canvas").clicked() {
-                        clear_requested = true;
-                    }
+                    ui.horizontal(|ui| {
+                        let pause_label = if self.paused { "▶ Resume" } else { "⏸ Pause" };
+                        if ui
+                            .button(pause_label)
+                            .on_hover_text("Pause or resume the per-frame simulation loop.")
+                            .clicked()
+                        {
+                            self.paused = !self.paused;
+                        }
+                        if ui
+                            .add_enabled(self.paused, egui::Button::new("⏭ Step 1 Frame"))
+                            .on_hover_text(
+                                "Advance the fluid solver by exactly one timestep while paused.",
+                            )
+                            .clicked()
+                        {
+                            step_once_requested = true;
+                        }
+                        if ui
+                            .button("Clear")
+                            .on_hover_text(
+                                "Reset velocity, dye, pressure, and divergence textures to zero.",
+                            )
+                            .clicked()
+                        {
+                            clear_requested = true;
+                        }
+                    });
 
                     ui.separator();
                     ui.small(format!(
@@ -268,7 +368,7 @@ impl AppState {
                         self.solver.dye.width,
                         self.solver.dye.height,
                     ));
-                    ui.small("Drag left mouse on the canvas to inject dye and velocity.");
+                    ui.small("Hover any control for a mathematical & physical explanation.");
                 });
 
             // `available_rect()` is the logical area left over after docking the left SidePanel.
@@ -290,6 +390,7 @@ impl AppState {
 
         // Sync UI parameters into SimParams before uploading to the GPU uniform buffer.
         self.solver.params.display_mode = self.display_mode as u32;
+        self.solver.params.use_f32_bilerp = u32::from(self.use_f32_bilerp);
         self.solver.params.splat_radius = self.splat_radius;
         self.solver.params.splat_color = [
             self.splat_color[0],
@@ -307,9 +408,19 @@ impl AppState {
                 label: Some("frame_command_encoder"),
             });
 
-        // 1. Run GPU fluid compute passes.
-        self.solver
-            .step(&self.gpu.device, &self.gpu.queue, &mut encoder);
+        // 1. Run GPU fluid compute passes (unless paused, or if the user clicked "Step 1 Frame"
+        // or is actively painting with the mouse).
+        if !self.paused || step_once_requested || self.solver.params.splat_active != 0 {
+            self.solver
+                .step(&self.gpu.device, &self.gpu.queue, &mut encoder);
+        } else {
+            // Even while paused, upload `params_buffer` so switching `DisplayMode` updates immediately.
+            self.gpu.queue.write_buffer(
+                &self.solver.params_buffer,
+                0,
+                bytemuck::bytes_of(&self.solver.params),
+            );
+        }
 
         // If the mouse button is held down without moving, zero the velocity delta so we
         // don't keep re-injecting the previous frame's movement impulse.

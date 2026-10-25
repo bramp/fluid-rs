@@ -24,7 +24,7 @@ struct SimParams {
     splat_radius: f32,
     splat_active: u32,
     scenario_mode: u32,
-    _padding: u32,
+    use_f32_bilerp: u32,
 };
 
 // Converts integer texel coordinates `(i, j)` to normalized cell-center UV coordinates in `[0.0, 1.0]`.

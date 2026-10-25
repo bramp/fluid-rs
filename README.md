@@ -35,13 +35,15 @@ Then open `http://127.0.0.1:8080` in a WebGPU-capable browser.
 
 ## Project Structure
 
-See [DESIGN.md](./DESIGN.md) for the full architectural blueprint and mathematical breakdown.
+- See [EXPLAINER.md](./EXPLAINER.md) for a **start-to-finish guide to fluid dynamics**, the Navier-Stokes equations, numerical methods, and how each shader works.
+- See [DESIGN.md](./DESIGN.md) for the architectural blueprint, GPU texture table, and milestone roadmap.
 
 ```text
 fluid-rs/
 ├── Cargo.toml               # Crate dependencies (native & wasm32)
 ├── Trunk.toml               # Trunk WebAssembly bundler config
 ├── index.html               # Browser entrypoint for WebGPU canvas
+├── EXPLAINER.md             # Start-to-finish fluid dynamics & code walkthrough
 ├── DESIGN.md                # Architecture, GPU texture table & roadmap
 ├── AGENTS.md                # Coding style, GPU invariants & agent instructions
 └── src/
@@ -52,8 +54,12 @@ fluid-rs/
     ├── uniforms.rs          # #[repr(C)] SimParams uniform buffer (16-byte aligned)
     ├── solver.rs            # FluidSolver compute/render pipelines & headless shader tests
     └── shaders/
-        ├── common.wgsl      # Shared SimParams struct & grid coordinate helpers
+        ├── common.wgsl      # Shared SimParams struct, coordinate helpers & f32 bilerp
         ├── splat.wgsl       # Gaussian velocity & dye impulse compute shader
+        ├── advect.wgsl      # Semi-Lagrangian velocity & dye advection compute shader
+        ├── divergence.wgsl  # Central-difference velocity divergence compute shader
+        ├── jacobi.wgsl      # Iterative Poisson pressure solver compute shader
+        ├── project.wgsl     # Pressure gradient subtraction compute shader
         └── render.wgsl      # Fullscreen procedural triangle & debug visualizations
 ```
 

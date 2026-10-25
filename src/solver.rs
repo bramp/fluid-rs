@@ -56,6 +56,14 @@ pub struct FluidSolver {
     /// iteration ("warm starting"), accelerating convergence for smoothly varying flows.
     pub warm_start_pressure: bool,
 
+    /// Toggles Pass 2: Velocity Self-Advection ($\mathbf{u}$ transporting $\mathbf{u}$).
+    pub enable_velocity_advection: bool,
+    /// Toggles Passes 3–5: Divergence, Jacobi Poisson solver, and Pressure Gradient Subtraction.
+    /// Disabling this makes the fluid compressible (reproducing Milestone 2's Burgers shocks).
+    pub enable_pressure_projection: bool,
+    /// Toggles Pass 6: High-Resolution Dye Advection ($\mathbf{u}$ transporting pigment).
+    pub enable_dye_advection: bool,
+
     splat_bind_group_layout: wgpu::BindGroupLayout,
     splat_vel_pipeline: wgpu::ComputePipeline,
     splat_dye_pipeline: wgpu::ComputePipeline,
@@ -585,6 +593,9 @@ impl FluidSolver {
             linear_sampler,
             jacobi_iterations: 35,
             warm_start_pressure: true,
+            enable_velocity_advection: true,
+            enable_pressure_projection: true,
+            enable_dye_advection: true,
             splat_bind_group_layout,
             splat_vel_pipeline,
             splat_dye_pipeline,
@@ -688,64 +699,104 @@ impl FluidSolver {
         // Pass 2: Velocity Self-Advection (`velocity.read` advects itself into `velocity.write`).
         // In WebGPU, binding the same read-only TextureView (`velocity.read`) to two sampled
         // bindings (@binding(2) and @binding(3)) is valid because neither is a storage write target.
-        let advect_vel_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("advect_vel_bg"),
-            layout: &self.advect_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
-                },
-            ],
-        });
-
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("advect_vel_pass"),
-                timestamp_writes: None,
+        if self.enable_velocity_advection {
+            let advect_vel_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("advect_vel_bg"),
+                layout: &self.advect_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
+                    },
+                ],
             });
-            cpass.set_pipeline(&self.advect_vel_pipeline);
-            cpass.set_bind_group(0, &advect_vel_bg, &[]);
-            cpass.dispatch_workgroups(
-                self.velocity.width.div_ceil(8),
-                self.velocity.height.div_ceil(8),
-                1,
-            );
-        }
-        self.velocity.swap();
 
-        // Pass 3: Velocity Divergence ($\nabla \cdot \mathbf{u}^*$).
-        self.dispatch_divergence(device, encoder, "divergence_pre_project_pass");
-
-        // Pass 4: Iterative Jacobi Poisson Pressure Solver ($\nabla^2 p = \nabla \cdot \mathbf{u}^*$).
-        // When `warm_start_pressure` is false, zero `pressure.read` before starting the relaxation
-        // loop so the user can compare cold-start vs. warm-start convergence in real time.
-        if !self.warm_start_pressure {
-            self.pressure.read.clear(queue, 8);
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("advect_vel_pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.advect_vel_pipeline);
+                cpass.set_bind_group(0, &advect_vel_bg, &[]);
+                cpass.dispatch_workgroups(
+                    self.velocity.width.div_ceil(8),
+                    self.velocity.height.div_ceil(8),
+                    1,
+                );
+            }
+            self.velocity.swap();
         }
 
-        let sim_wg_x = self.velocity.width.div_ceil(8);
-        let sim_wg_y = self.velocity.height.div_ceil(8);
+        // Passes 3–5: Divergence, Jacobi Poisson Pressure Solver, and Pressure Projection.
+        if self.enable_pressure_projection {
+            // Pass 3: Velocity Divergence ($\nabla \cdot \mathbf{u}^*$).
+            self.dispatch_divergence(device, encoder, "divergence_pre_project_pass");
 
-        for _ in 0..self.jacobi_iterations {
-            let jacobi_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("jacobi_bg"),
+            // Pass 4: Iterative Jacobi Poisson Pressure Solver ($\nabla^2 p = \nabla \cdot \mathbf{u}^*$).
+            // When `warm_start_pressure` is false, zero `pressure.read` before starting the relaxation
+            // loop so the user can compare cold-start vs. warm-start convergence in real time.
+            if !self.warm_start_pressure {
+                self.pressure.read.clear(queue, 8);
+            }
+
+            let sim_wg_x = self.velocity.width.div_ceil(8);
+            let sim_wg_y = self.velocity.height.div_ceil(8);
+
+            for _ in 0..self.jacobi_iterations {
+                let jacobi_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("jacobi_bg"),
+                    layout: &self.pressure_project_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&self.pressure.read.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&self.divergence.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&self.pressure.write.view),
+                        },
+                    ],
+                });
+
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("jacobi_pass"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&self.jacobi_pipeline);
+                    cpass.set_bind_group(0, &jacobi_bg, &[]);
+                    cpass.dispatch_workgroups(sim_wg_x, sim_wg_y, 1);
+                }
+                self.pressure.swap();
+            }
+
+            // Pass 5: Pressure Gradient Subtraction ($\mathbf{u}^{n+1} = \mathbf{u}^* - \nabla p$).
+            let project_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("project_bg"),
                 layout: &self.pressure_project_bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -754,111 +805,83 @@ impl FluidSolver {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&self.pressure.read.view),
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&self.divergence.view),
+                        resource: wgpu::BindingResource::TextureView(&self.pressure.read.view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&self.pressure.write.view),
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
                     },
                 ],
             });
 
             {
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("jacobi_pass"),
+                    label: Some("project_pass"),
                     timestamp_writes: None,
                 });
-                cpass.set_pipeline(&self.jacobi_pipeline);
-                cpass.set_bind_group(0, &jacobi_bg, &[]);
+                cpass.set_pipeline(&self.project_pipeline);
+                cpass.set_bind_group(0, &project_bg, &[]);
                 cpass.dispatch_workgroups(sim_wg_x, sim_wg_y, 1);
             }
-            self.pressure.swap();
+            self.velocity.swap();
         }
 
-        // Pass 5: Pressure Gradient Subtraction ($\mathbf{u}^{n+1} = \mathbf{u}^* - \nabla p$).
-        let project_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("project_bg"),
-            layout: &self.pressure_project_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.pressure.read.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
-                },
-            ],
-        });
-
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("project_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.project_pipeline);
-            cpass.set_bind_group(0, &project_bg, &[]);
-            cpass.dispatch_workgroups(sim_wg_x, sim_wg_y, 1);
-        }
-        self.velocity.swap();
-
-        // When the user selects the `Divergence` debug view, recompute $\nabla \cdot \mathbf{u}^{n+1}$
-        // after projection so they can verify that incompressibility holds (nearly black at 35
-        // Jacobi iterations, lighting up if iterations are reduced toward 0).
+        // When the user selects the `Divergence` debug view, compute $\nabla \cdot \mathbf{u}$
+        // on the final velocity field so they can inspect incompressibility (nearly black when
+        // pressure projection is enabled with ~35 Jacobi iterations, or bright red/blue when
+        // pressure projection is disabled or under-iterated).
         if self.params.display_mode == DisplayMode::Divergence as u32 {
             self.dispatch_divergence(device, encoder, "divergence_post_project_pass");
         }
 
-        // Pass 6: High-Resolution Dye Advection (`dye.read` advected along divergence-free `velocity.read`).
-        let advect_dye_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("advect_dye_bg"),
-            layout: &self.advect_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&self.dye.read.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&self.dye.write.view),
-                },
-            ],
-        });
-
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("advect_dye_pass"),
-                timestamp_writes: None,
+        // Pass 6: High-Resolution Dye Advection (`dye.read` advected along `velocity.read`).
+        if self.enable_dye_advection {
+            let advect_dye_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("advect_dye_bg"),
+                layout: &self.advect_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.dye.read.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&self.dye.write.view),
+                    },
+                ],
             });
-            cpass.set_pipeline(&self.advect_dye_pipeline);
-            cpass.set_bind_group(0, &advect_dye_bg, &[]);
-            cpass.dispatch_workgroups(self.dye.width.div_ceil(8), self.dye.height.div_ceil(8), 1);
+
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("advect_dye_pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.advect_dye_pipeline);
+                cpass.set_bind_group(0, &advect_dye_bg, &[]);
+                cpass.dispatch_workgroups(
+                    self.dye.width.div_ceil(8),
+                    self.dye.height.div_ceil(8),
+                    1,
+                );
+            }
+            self.dye.swap();
         }
-        self.dye.swap();
     }
 
     /// Helper that dispatches `divergence_pipeline` to compute $\nabla \cdot \mathbf{u}$ from

@@ -37,6 +37,24 @@ impl DisplayMode {
             Self::Divergence => "Divergence (Post-Projection)",
         }
     }
+
+    /// Returns an educational tooltip explaining what this visualization mode displays.
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Self::Dye => {
+                "Renders the high-resolution (1024×1024) passive dye pigment advected through the velocity field."
+            }
+            Self::Velocity => {
+                "Visualizes the 2D velocity vector field u = (ux, uy): direction angle maps to hue (color wheel) and speed maps to brightness."
+            }
+            Self::Pressure => {
+                "Visualizes scalar pressure p solved by the Jacobi Poisson pass: warm orange/red = high pressure (fluid pushing outward), cool blue = low pressure (suction wake)."
+            }
+            Self::Divergence => {
+                "Visualizes velocity divergence (∇ · u) after projection. For an incompressible fluid with ~35 Jacobi iterations, this stays nearly black; lower Jacobi iterations to see un-cancelled compression (blue) and expansion (red)."
+            }
+        }
+    }
 }
 
 /// GPU-aligned simulation uniform buffer (112 bytes total, 16-byte aligned).
@@ -95,8 +113,9 @@ pub struct SimParams {
     pub splat_active: u32,
     /// Active scenario preset (`0`: MilkCoffee, `1`: RiverRocks, `2`: Guinness).
     pub scenario_mode: u32,
-    /// Explicit trailing padding so the total struct size is `7 * 16 = 112` bytes.
-    pub _padding: u32,
+    /// Non-zero (`1`) to use 32-bit float software bilinear interpolation (`bilerp`) instead of
+    /// 8-bit hardware `textureSampleLevel` during advection.
+    pub use_f32_bilerp: u32,
 }
 
 // Compile-time check guaranteeing our Rust struct matches the 112-byte WGSL uniform layout.
@@ -127,7 +146,7 @@ impl SimParams {
             splat_radius: 0.025,
             splat_active: 0,
             scenario_mode: 0,
-            _padding: 0,
+            use_f32_bilerp: 1,
         }
     }
 }

@@ -8,6 +8,10 @@ Architecture, mathematical formulas, and milestone specifications live in [DESIG
   - Every module (`//!`), public struct/enum, and function (`///`) must have clear rustdoc comments explaining **why** a design choice exists (e.g., why `Rgba16Float` is used, why textures are ping-ponged, or how a numerical stencil works), not just restating the signature.
   - Use intra-doc links (e.g., [`PingPongTexture`], [`wgpu::Device`]) and verify they resolve without warnings.
   - Include explanatory comments inside `.wgsl` shaders for grid math, boundary conditions, and numerical schemes.
+- **Interactive Controls, Tooltips & Companion Explainer**:
+  - Every new simulation pass or algorithm (e.g. vorticity confinement, MacCormack vs. Semi-Lagrangian advection, obstacles, buoyancy) must have an interactive enable/disable toggle or selector in the `egui` sidebar ([`src/app.rs`](./src/app.rs)) so the user can experiment with its effect live.
+  - Every `egui` widget must include a detailed `.on_hover_text(...)` tooltip explaining what the control or mathematical parameter does and what happens at extreme values.
+  - Keep [EXPLAINER.md](./EXPLAINER.md) updated as new milestones are implemented so it remains a complete, start-to-finish educational guide to the math, physics, and code.
 - **Clean Platform Separation**:
   - Keep `#[cfg(not(target_arch = "wasm32"))]` and `#[cfg(target_arch = "wasm32")]` implementations in separate, self-contained functions or `impl` blocks (see [`FluidApp`] in [src/app.rs](./src/app.rs)) rather than interleaving `#[cfg]` blocks inside method bodies.
 - **Error Handling & Logging**:
