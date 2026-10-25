@@ -28,7 +28,7 @@
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var pressure_in: texture_2d<f32>;
 @group(0) @binding(2) var div_in: texture_2d<f32>;
-@group(0) @binding(3) var pressure_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(3) var pressure_out: texture_storage_2d<rgba32float, write>;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {

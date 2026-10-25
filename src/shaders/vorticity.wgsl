@@ -26,7 +26,7 @@
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var vel_in: texture_2d<f32>;
 @group(0) @binding(2) var curl_in: texture_2d<f32>;
-@group(0) @binding(3) var out_tex: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(3) var out_tex: texture_storage_2d<rgba32float, write>;
 
 @compute @workgroup_size(8, 8, 1)
 fn compute_curl(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -67,17 +67,21 @@ fn apply_vorticity(@builtin(global_invocation_id) id: vec3<u32>) {
     let c_bot   = abs(textureLoad(curl_in, coords - vec2<i32>(0, 1), 0).x);
 
     // Gradient of curl magnitude $\boldsymbol{\eta} = \nabla |\omega|$ pointing toward the vortex center.
-    // Adding a soft regularization constant (`1.5`) in the denominator prevents 2-pixel grid noise
-    // (where `length(eta)` is tiny) from being normalized to a full unit vector and amplified into
-    // permanent high-frequency pixel jitter.
     let eta = 0.5 * vec2<f32>(c_right - c_left, c_top - c_bot);
-    let norm_eta = eta / (length(eta) + 1.5);
+    let eta_len = length(eta);
+    let norm_eta = eta / (eta_len + 1e-4);
 
     let omega = textureLoad(curl_in, coords, 0).x;
-    // Cross product $\mathbf{N} \times (0, 0, \omega) = (N_y \omega, -N_x \omega)$, scaled by 0.15
-    // so vorticity confinement gently sustains coherent eddies without overpowering dissipation.
-    let force = 0.15 * params.vorticity_strength * vec2<f32>(norm_eta.y * omega, -norm_eta.x * omega);
+    let vel_center = textureLoad(vel_in, coords, 0).xy;
+    let speed = length(vel_center);
 
-    let vel = textureLoad(vel_in, coords, 0).xy + params.dt * force;
+    // Taper vorticity confinement smoothly when local speed drops below ~6 texels/sec or when
+    // curl gradient is tiny grid noise (`eta_len < 0.25`). This preserves 100% full-strength
+    // fractal curls during active swirling while preventing vorticity confinement from acting
+    // as a perpetual-motion machine that amplifies 2-pixel Nyquist noise after the flow settles.
+    let active_mask = smoothstep(0.5, 6.0, speed) * smoothstep(0.05, 0.4, eta_len);
+    let force = params.vorticity_strength * active_mask * vec2<f32>(norm_eta.y * omega, -norm_eta.x * omega);
+
+    let vel = vel_center + params.dt * force;
     textureStore(out_tex, coords, vec4<f32>(vel, 0.0, 1.0));
 }

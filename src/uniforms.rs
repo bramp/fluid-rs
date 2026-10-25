@@ -76,7 +76,7 @@ impl DisplayMode {
     }
 }
 
-/// GPU-aligned simulation uniform buffer (112 bytes total, 16-byte aligned).
+/// GPU-aligned simulation uniform buffer (128 bytes total, 16-byte aligned).
 ///
 /// This struct is uploaded once per frame to the GPU via `Queue::write_buffer` and
 /// mirrors `struct SimParams` in `src/shaders/common.wgsl` field-for-field.
@@ -100,9 +100,9 @@ pub struct SimParams {
     pub dt: f32,
     /// Scaling factor for vorticity confinement curl injection.
     pub vorticity_strength: f32,
-    /// Per-step multiplicative damping factor for velocity (e.g. `0.999`).
+    /// Per-step multiplicative damping factor for velocity (e.g. `0.998`).
     pub velocity_dissipation: f32,
-    /// Per-step multiplicative fade factor for dye concentration (e.g. `0.9995`).
+    /// Per-step multiplicative fade factor for dye (`1.0` = 100% mass conservation so milk merges into coffee).
     pub dye_dissipation: f32,
 
     // --- 16-byte block 4 (bytes 48..64) ---
@@ -133,12 +133,19 @@ pub struct SimParams {
     /// Active scenario preset (`0`: MilkCoffee, `1`: RiverRocks, `2`: Guinness).
     pub scenario_mode: u32,
     /// Non-zero (`1`) to use 32-bit float software bilinear interpolation (`bilerp`) instead of
-    /// 8-bit hardware `textureSampleLevel` during advection.
+    /// 8-bit quantized sub-texel weights during advection.
     pub use_f32_bilerp: u32,
+
+    // --- 16-byte block 8 (bytes 112..128) ---
+    /// Mass-conserving Fickian Laplacian diffusion rate ($\kappa \in [0.0, 0.20]$) controlling how
+    /// fast milk molecules blend into neighboring coffee texels while conserving total milk mass.
+    pub dye_diffusion: f32,
+    /// Explicit trailing padding so the total struct size is `8 * 16 = 128` bytes.
+    pub _padding: [u32; 3],
 }
 
-// Compile-time check guaranteeing our Rust struct matches the 112-byte WGSL uniform layout.
-const _: () = assert!(std::mem::size_of::<SimParams>() == 112);
+// Compile-time check guaranteeing our Rust struct matches the 128-byte WGSL uniform layout.
+const _: () = assert!(std::mem::size_of::<SimParams>() == 128);
 
 impl SimParams {
     /// Creates a [`SimParams`] initialized with sensible default physical constants for the given grid sizes.
@@ -150,9 +157,10 @@ impl SimParams {
             inv_dye_size: [1.0 / dye_width as f32, 1.0 / dye_height as f32],
 
             dt: 1.0 / 60.0,
-            vorticity_strength: 12.0,
-            velocity_dissipation: 0.993,
-            dye_dissipation: 0.998,
+            vorticity_strength: 22.0,
+            velocity_dissipation: 0.996,
+            // 1.0 = 100% of poured milk stays in the cup and mixes into the coffee!
+            dye_dissipation: 1.0,
 
             buoyancy_alpha: 1.0,
             buoyancy_beta: 2.5,
@@ -166,6 +174,8 @@ impl SimParams {
             splat_active: 0,
             scenario_mode: 0,
             use_f32_bilerp: 1,
+            dye_diffusion: 0.04,
+            _padding: [0; 3],
         }
     }
 }

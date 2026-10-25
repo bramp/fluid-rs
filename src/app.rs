@@ -309,11 +309,18 @@ impl AppState {
                         "Per-frame multiplier on velocity (1.0 = no drag, < 1.0 = exponential damping that gradually brings the fluid to rest).",
                     );
                     ui.add(
-                        egui::Slider::new(&mut self.solver.params.dye_dissipation, 0.95..=1.0)
-                            .text("Dye Dissipation"),
+                        egui::Slider::new(&mut self.solver.params.dye_diffusion, 0.0..=0.25)
+                            .text("Milk Diffusion (κ)"),
                     )
                     .on_hover_text(
-                        "Per-frame multiplier on dye concentration (1.0 = pigment never fades, < 1.0 = dye gradually dissolves back to background).",
+                        "Mass-conserving Fickian Laplacian diffusion rate (∂m/∂t = κ∇²m). Spreads milk into neighboring coffee cells without losing any total milk mass, gradually turning dark espresso into creamy latte!",
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.solver.params.dye_dissipation, 0.98..=1.0)
+                            .text("Dye Retention"),
+                    )
+                    .on_hover_text(
+                        "Per-frame mass retention multiplier (1.0 = 100% of poured milk stays in the cup and mixes into the coffee; < 1.0 = pigment slowly vanishes back to black).",
                     );
 
                     ui.separator();

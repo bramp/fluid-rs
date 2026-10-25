@@ -39,20 +39,18 @@ pub struct FluidSolver {
     pub params: SimParams,
     /// GPU uniform buffer bound at `@group(0) @binding(0)` across all shaders.
     pub params_buffer: wgpu::Buffer,
-    /// Double-buffered 2D velocity field $(u_x, u_y)$ stored in `Rgba16Float` at simulation resolution.
+    /// Double-buffered 2D velocity field $(u_x, u_y)$ stored in `Rgba32Float` at simulation resolution.
     pub velocity: PingPongTexture,
-    /// Double-buffered high-resolution pigment/scalar field stored in `Rgba16Float`.
+    /// Double-buffered high-resolution pigment/scalar field stored in `Rgba32Float`.
     pub dye: PingPongTexture,
-    /// Double-buffered scalar pressure field $p$ stored in `Rgba16Float` at simulation resolution.
+    /// Double-buffered scalar pressure field $p$ stored in `Rgba32Float` at simulation resolution.
     pub pressure: PingPongTexture,
-    /// Single-buffered scalar velocity divergence $\nabla \cdot \mathbf{u}$ stored in `Rgba16Float`.
+    /// Single-buffered scalar velocity divergence $\nabla \cdot \mathbf{u}$ stored in `Rgba32Float`.
     pub divergence: GpuTexture,
-    /// Single-buffered scalar 2D curl (vorticity $\omega = \nabla \times \mathbf{u}$) stored in `Rgba16Float`.
+    /// Single-buffered scalar 2D curl (vorticity $\omega = \nabla \times \mathbf{u}$) stored in `Rgba32Float`.
     pub curl: GpuTexture,
     /// Scratch buffer for storing the predictor field $\hat{\phi}^{n+1}$ during MacCormack dye advection.
     pub scratch_dye: GpuTexture,
-    /// Hardware bilinear sampler (`FilterMode::Linear`, `AddressMode::ClampToEdge`) for fractional UV lookups.
-    pub linear_sampler: wgpu::Sampler,
 
     /// Number of Jacobi Poisson relaxations per frame (typically `30..=50`).
     pub jacobi_iterations: u32,
@@ -78,6 +76,7 @@ pub struct FluidSolver {
 
     advect_bind_group_layout: wgpu::BindGroupLayout,
     advect_vel_pipeline: wgpu::ComputePipeline,
+    advect_dye_pred_pipeline: wgpu::ComputePipeline,
     advect_dye_pipeline: wgpu::ComputePipeline,
     maccormack_dye_pipeline: wgpu::ComputePipeline,
 
@@ -121,30 +120,20 @@ impl FluidSolver {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Why Rgba16Float?
-        // In WebGPU, 32-bit float textures (`Rgba32Float`) cannot be bilinearly filtered by
-        // hardware samplers unless an optional extension is enabled, whereas 16-bit half-float
-        // (`Rgba16Float`) is universally filterable AND supports compute `STORAGE_BINDING` writes.
-        let tex_format = wgpu::TextureFormat::Rgba16Float;
+        // Why Rgba32Float with software `bilerp`?
+        // Using full 32-bit IEEE 754 floats (`Rgba32Float`) eliminates 16-bit half-float (`f16`)
+        // mantissa quantization so mass-conserving Laplacian diffusion ($\kappa \nabla^2 \phi$)
+        // and MacCormack error correction operate with 7-digit precision. Because our shaders
+        // perform bilinear interpolation via `textureLoad` (`bilerp` in `common.wgsl`) rather than
+        // hardware `textureSampleLevel`, `Rgba32Float` (`filterable: false`) works on 100% of
+        // core WebGPU and native devices with `wgpu::Features::empty()`!
+        let tex_format = wgpu::TextureFormat::Rgba32Float;
         let velocity = PingPongTexture::new(device, sim_width, sim_height, tex_format, "velocity");
         let dye = PingPongTexture::new(device, dye_width, dye_height, tex_format, "dye");
         let pressure = PingPongTexture::new(device, sim_width, sim_height, tex_format, "pressure");
         let divergence = GpuTexture::new(device, sim_width, sim_height, tex_format, "divergence");
         let curl = GpuTexture::new(device, sim_width, sim_height, tex_format, "curl");
         let scratch_dye = GpuTexture::new(device, dye_width, dye_height, tex_format, "scratch_dye");
-
-        // Linear sampler used when sampling between grid cells (e.g. semi-Lagrangian advection
-        // and upsampling simulation textures onto the window viewport).
-        let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("linear_clamp_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
 
         // --- Splat Compute Pipelines ---
         // Injects Gaussian velocity impulses and dye pigment where the user drags the mouse.
@@ -171,7 +160,7 @@ impl FluidSolver {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -193,7 +182,7 @@ impl FluidSolver {
                         binding: 3,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -240,9 +229,7 @@ impl FluidSolver {
             cache: None,
         });
 
-        // --- Semi-Lagrangian Advection Compute Pipelines ---
-        // Transports velocity and dye along the velocity field via backward Euler particle tracing
-        // and hardware bilinear interpolation (`linear_sampler`).
+        // --- Semi-Lagrangian & MacCormack Advection Compute Pipelines ---
         let advect_shader =
             create_shader_with_common(device, "advect_shader", include_str!("shaders/advect.wgsl"));
 
@@ -261,38 +248,31 @@ impl FluidSolver {
                         },
                         count: None,
                     },
-                    // @binding(1): Bilinear sampler for fractional departure point lookups
+                    // @binding(1): Advecting velocity field (`vel_in`)
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
                         count: None,
                     },
-                    // @binding(2): Advecting velocity field (`vel_in`)
+                    // @binding(2): Quantity being advected (`source_in`, either velocity or dye)
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
                         count: None,
                     },
-                    // @binding(3): Quantity being advected (`source_in`, either velocity or dye)
+                    // @binding(3): Write-only output storage texture (`field_out`)
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    // @binding(4): Write-only output storage texture (`field_out`)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::StorageTexture {
                             access: wgpu::StorageTextureAccess::WriteOnly,
@@ -301,12 +281,12 @@ impl FluidSolver {
                         },
                         count: None,
                     },
-                    // @binding(5): Forward-advected predictor field (`phi_hat_in`) for MacCormack correction
+                    // @binding(4): Forward-advected predictor field (`phi_hat_in`) for MacCormack correction
                     wgpu::BindGroupLayoutEntry {
-                        binding: 5,
+                        binding: 4,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -328,6 +308,16 @@ impl FluidSolver {
                 layout: Some(&advect_pipeline_layout),
                 module: &advect_shader,
                 entry_point: Some("advect_velocity"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let advect_dye_pred_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("advect_dye_pred_pipeline"),
+                layout: Some(&advect_pipeline_layout),
+                module: &advect_shader,
+                entry_point: Some("advect_dye_predictor"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -380,7 +370,7 @@ impl FluidSolver {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -454,7 +444,7 @@ impl FluidSolver {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -465,7 +455,7 @@ impl FluidSolver {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -548,63 +538,56 @@ impl FluidSolver {
                         },
                         count: None,
                     },
-                    // @binding(1): Bilinear sampler for smooth viewport scaling
+                    // @binding(1): Current dye texture (`dye.read`)
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
                         count: None,
                     },
-                    // @binding(2): Current dye texture (`dye.read`)
+                    // @binding(2): Current velocity texture (`velocity.read`)
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
                         count: None,
                     },
-                    // @binding(3): Current velocity texture (`velocity.read`)
+                    // @binding(3): Current pressure texture (`pressure.read`)
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
                         count: None,
                     },
-                    // @binding(4): Current pressure texture (`pressure.read`)
+                    // @binding(4): Velocity divergence texture (`divergence`)
                     wgpu::BindGroupLayoutEntry {
                         binding: 4,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
                         count: None,
                     },
-                    // @binding(5): Velocity divergence texture (`divergence`)
+                    // @binding(5): Scalar 2D curl / vorticity texture (`curl`)
                     wgpu::BindGroupLayoutEntry {
                         binding: 5,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    // @binding(6): Scalar 2D curl / vorticity texture (`curl`)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 6,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -660,7 +643,6 @@ impl FluidSolver {
             divergence,
             curl,
             scratch_dye,
-            linear_sampler,
             jacobi_iterations: 35,
             warm_start_pressure: true,
             enable_vorticity_confinement: true,
@@ -673,6 +655,7 @@ impl FluidSolver {
             splat_dye_pipeline,
             advect_bind_group_layout,
             advect_vel_pipeline,
+            advect_dye_pred_pipeline,
             advect_dye_pipeline,
             maccormack_dye_pipeline,
             divergence_bind_group_layout,
@@ -689,13 +672,13 @@ impl FluidSolver {
 
     /// Resets all simulation textures (`velocity`, `dye`, `pressure`, `divergence`, and `curl`) to zero.
     pub fn clear(&self, queue: &wgpu::Queue) {
-        // Rgba16Float has 4 channels * 2 bytes (f16) = 8 bytes per texel.
-        self.velocity.clear(queue, 8);
-        self.dye.clear(queue, 8);
-        self.pressure.clear(queue, 8);
-        self.divergence.clear(queue, 8);
-        self.curl.clear(queue, 8);
-        self.scratch_dye.clear(queue, 8);
+        // Rgba32Float has 4 channels * 4 bytes (f32) = 16 bytes per texel.
+        self.velocity.clear(queue, 16);
+        self.dye.clear(queue, 16);
+        self.pressure.clear(queue, 16);
+        self.divergence.clear(queue, 16);
+        self.curl.clear(queue, 16);
+        self.scratch_dye.clear(queue, 16);
     }
 
     /// Reallocates the high-resolution `dye` and `scratch_dye` textures at a new resolution
@@ -707,14 +690,14 @@ impl FluidSolver {
         new_width: u32,
         new_height: u32,
     ) {
-        let tex_format = wgpu::TextureFormat::Rgba16Float;
+        let tex_format = wgpu::TextureFormat::Rgba32Float;
         self.dye = PingPongTexture::new(device, new_width, new_height, tex_format, "dye");
         self.scratch_dye =
             GpuTexture::new(device, new_width, new_height, tex_format, "scratch_dye");
         self.params.dye_size = [new_width as f32, new_height as f32];
         self.params.inv_dye_size = [1.0 / new_width as f32, 1.0 / new_height as f32];
-        self.dye.clear(queue, 8);
-        self.scratch_dye.clear(queue, 8);
+        self.dye.clear(queue, 16);
+        self.scratch_dye.clear(queue, 16);
     }
 
     /// Advances the fluid simulation by one timestep on the GPU.
@@ -888,7 +871,7 @@ impl FluidSolver {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                        resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -896,14 +879,10 @@ impl FluidSolver {
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
                         resource: wgpu::BindingResource::TextureView(&self.velocity.write.view),
                     },
                     wgpu::BindGroupEntry {
-                        binding: 5,
+                        binding: 4,
                         resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
                     },
                 ],
@@ -929,7 +908,7 @@ impl FluidSolver {
             // When `warm_start_pressure` is false, zero `pressure.read` before starting the relaxation
             // loop so the user can compare cold-start vs. warm-start convergence in real time.
             if !self.warm_start_pressure {
-                self.pressure.read.clear(queue, 8);
+                self.pressure.read.clear(queue, 16);
             }
 
             for _ in 0..self.jacobi_iterations {
@@ -1023,22 +1002,18 @@ impl FluidSolver {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
                             resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
                         },
                         wgpu::BindGroupEntry {
-                            binding: 3,
+                            binding: 2,
                             resource: wgpu::BindingResource::TextureView(&self.dye.read.view),
                         },
                         wgpu::BindGroupEntry {
-                            binding: 4,
+                            binding: 3,
                             resource: wgpu::BindingResource::TextureView(&self.scratch_dye.view),
                         },
                         wgpu::BindGroupEntry {
-                            binding: 5,
+                            binding: 4,
                             resource: wgpu::BindingResource::TextureView(&self.dye.read.view),
                         },
                     ],
@@ -1054,22 +1029,18 @@ impl FluidSolver {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
                             resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
                         },
                         wgpu::BindGroupEntry {
-                            binding: 3,
+                            binding: 2,
                             resource: wgpu::BindingResource::TextureView(&self.dye.read.view),
                         },
                         wgpu::BindGroupEntry {
-                            binding: 4,
+                            binding: 3,
                             resource: wgpu::BindingResource::TextureView(&self.dye.write.view),
                         },
                         wgpu::BindGroupEntry {
-                            binding: 5,
+                            binding: 4,
                             resource: wgpu::BindingResource::TextureView(&self.scratch_dye.view),
                         },
                     ],
@@ -1079,7 +1050,7 @@ impl FluidSolver {
                     label: Some("maccormack_dye_pass"),
                     timestamp_writes: None,
                 });
-                cpass.set_pipeline(&self.advect_dye_pipeline);
+                cpass.set_pipeline(&self.advect_dye_pred_pipeline);
                 cpass.set_bind_group(0, &pred_dye_bg, &[]);
                 cpass.dispatch_workgroups(dye_wg_x, dye_wg_y, 1);
 
@@ -1097,22 +1068,18 @@ impl FluidSolver {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
                             resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
                         },
                         wgpu::BindGroupEntry {
-                            binding: 3,
+                            binding: 2,
                             resource: wgpu::BindingResource::TextureView(&self.dye.read.view),
                         },
                         wgpu::BindGroupEntry {
-                            binding: 4,
+                            binding: 3,
                             resource: wgpu::BindingResource::TextureView(&self.dye.write.view),
                         },
                         wgpu::BindGroupEntry {
-                            binding: 5,
+                            binding: 4,
                             resource: wgpu::BindingResource::TextureView(&self.dye.read.view),
                         },
                     ],
@@ -1191,26 +1158,22 @@ impl FluidSolver {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
                     resource: wgpu::BindingResource::TextureView(&self.dye.read.view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 3,
+                    binding: 2,
                     resource: wgpu::BindingResource::TextureView(&self.velocity.read.view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 4,
+                    binding: 3,
                     resource: wgpu::BindingResource::TextureView(&self.pressure.read.view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 5,
+                    binding: 4,
                     resource: wgpu::BindingResource::TextureView(&self.divergence.view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 6,
+                    binding: 5,
                     resource: wgpu::BindingResource::TextureView(&self.curl.view),
                 },
             ],

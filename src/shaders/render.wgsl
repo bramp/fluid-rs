@@ -4,12 +4,11 @@
 // and samples the simulation textures according to `params.display_mode`.
 
 @group(0) @binding(0) var<uniform> params: SimParams;
-@group(0) @binding(1) var linear_sampler: sampler;
-@group(0) @binding(2) var dye_tex: texture_2d<f32>;
-@group(0) @binding(3) var vel_tex: texture_2d<f32>;
-@group(0) @binding(4) var pressure_tex: texture_2d<f32>;
-@group(0) @binding(5) var div_tex: texture_2d<f32>;
-@group(0) @binding(6) var curl_tex: texture_2d<f32>;
+@group(0) @binding(1) var dye_tex: texture_2d<f32>;
+@group(0) @binding(2) var vel_tex: texture_2d<f32>;
+@group(0) @binding(3) var pressure_tex: texture_2d<f32>;
+@group(0) @binding(4) var div_tex: texture_2d<f32>;
+@group(0) @binding(5) var curl_tex: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -83,22 +82,15 @@ fn shade_milk_in_coffee(uv: vec2<f32>, dye: vec4<f32>) -> vec3<f32> {
     // without embossing single-texel steps.
     let dx = vec2<f32>(params.inv_dye_size.x * 2.0, 0.0);
     let dy = vec2<f32>(0.0, params.inv_dye_size.y * 2.0);
-    let m_right = max(
-        textureSampleLevel(dye_tex, linear_sampler, uv + dx, 0.0).r,
-        textureSampleLevel(dye_tex, linear_sampler, uv + dx, 0.0).g,
-    );
-    let m_left = max(
-        textureSampleLevel(dye_tex, linear_sampler, uv - dx, 0.0).r,
-        textureSampleLevel(dye_tex, linear_sampler, uv - dx, 0.0).g,
-    );
-    let m_top = max(
-        textureSampleLevel(dye_tex, linear_sampler, uv + dy, 0.0).r,
-        textureSampleLevel(dye_tex, linear_sampler, uv + dy, 0.0).g,
-    );
-    let m_bot = max(
-        textureSampleLevel(dye_tex, linear_sampler, uv - dy, 0.0).r,
-        textureSampleLevel(dye_tex, linear_sampler, uv - dy, 0.0).g,
-    );
+    let d_right = bilerp(dye_tex, uv + dx, params.dye_size);
+    let d_left  = bilerp(dye_tex, uv - dx, params.dye_size);
+    let d_top   = bilerp(dye_tex, uv + dy, params.dye_size);
+    let d_bot   = bilerp(dye_tex, uv - dy, params.dye_size);
+
+    let m_right = max(d_right.r, max(d_right.g, d_right.b));
+    let m_left  = max(d_left.r, max(d_left.g, d_left.b));
+    let m_top   = max(d_top.r, max(d_top.g, d_top.b));
+    let m_bot   = max(d_bot.r, max(d_bot.g, d_bot.b));
 
     let grad_m = 0.5 * vec2<f32>(m_right - m_left, m_top - m_bot);
     let normal = normalize(vec3<f32>(-grad_m * 1.5, 1.0));
@@ -110,11 +102,11 @@ fn shade_milk_in_coffee(uv: vec2<f32>, dye: vec4<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let dye = textureSampleLevel(dye_tex, linear_sampler, in.uv, 0.0);
-    let vel = textureSampleLevel(vel_tex, linear_sampler, in.uv, 0.0).xy;
-    let pressure = textureSampleLevel(pressure_tex, linear_sampler, in.uv, 0.0).x;
-    let div = textureSampleLevel(div_tex, linear_sampler, in.uv, 0.0).x;
-    let curl = textureSampleLevel(curl_tex, linear_sampler, in.uv, 0.0).x;
+    let dye = bilerp(dye_tex, in.uv, params.dye_size);
+    let vel = bilerp(vel_tex, in.uv, params.sim_size).xy;
+    let pressure = bilerp(pressure_tex, in.uv, params.sim_size).x;
+    let div = bilerp(div_tex, in.uv, params.sim_size).x;
+    let curl = bilerp(curl_tex, in.uv, params.sim_size).x;
 
     var color = vec3<f32>(0.0);
 

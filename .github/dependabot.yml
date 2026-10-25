@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Keep Rust/Cargo dependencies up to date.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "friday"
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 3
+
+  # Keep GitHub Actions up to date.
+  # The github-actions ecosystem only supports default-days for cooldown.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "friday"
+    cooldown:
+      default-days: 7

@@ -25,7 +25,7 @@ Architecture, mathematical formulas, and milestone specifications live in [DESIG
   - Remember that `vec4<f32>` (`[f32; 4]`) requires 16-byte alignment in WGSL uniform address space.
 - **Core WebGPU Compatibility (No Native-Only Features)**:
   - Keep `required_features: wgpu::Features::empty()` so shaders and textures run identically on desktop Metal/Vulkan/DX12 and browser WebGPU.
-  - Use `Rgba16Float` for filterable storage textures (do not use `Rgba32Float` with linear samplers, and do not use `CommandEncoder::clear_texture` which requires `Features::CLEAR_TEXTURE`).
+  - Use `Rgba32Float` (`rgba32float`) with `TextureSampleType::Float { filterable: false }` and software `bilerp` (`textureLoad`) for full 32-bit float precision without requiring optional `FLOAT32_FILTERABLE` or `CLEAR_TEXTURE` features.
 - **Shader Composition**:
   - Shared WGSL declarations live in [src/shaders/common.wgsl](./src/shaders/common.wgsl) and are prepended at shader module creation time via `create_shader_with_common` in [src/solver.rs](./src/solver.rs).
   - Every new compute or render pipeline added to `FluidSolver::new` is automatically validated in headless GPU mode by `solver::tests::verify_wgsl_shaders_compile`.

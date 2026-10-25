@@ -17,7 +17,7 @@
 
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var vel_in: texture_2d<f32>;
-@group(0) @binding(2) var div_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var div_out: texture_storage_2d<rgba32float, write>;
 
 // Reads velocity at `coords`, returning `(0.0, 0.0)` if `coords` is outside the simulation domain.
 fn sample_vel_no_slip(coords: vec2<i32>, size: vec2<i32>) -> vec2<f32> {

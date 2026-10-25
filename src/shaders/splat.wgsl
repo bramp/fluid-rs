@@ -3,9 +3,9 @@
 
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var vel_in: texture_2d<f32>;
-@group(0) @binding(2) var vel_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var vel_out: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(3) var dye_in: texture_2d<f32>;
-@group(0) @binding(4) var dye_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(4) var dye_out: texture_storage_2d<rgba32float, write>;
 
 // Evaluates an isotropic 2D Gaussian falloff $\exp(-\|x - c\|^2 / r^2)$,
 // correcting for aspect ratio so the brush remains circular even on non-square grids.
