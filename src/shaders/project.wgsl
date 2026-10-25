@@ -39,18 +39,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    // In RiverRocks mode (`scenario_mode == 1`), preserve left inflow and allow open right outflow.
-    if params.scenario_mode == 1u {
-        if coords.x < 6 {
-            let inflow = textureLoad(vel_in, coords, 0);
-            textureStore(vel_out, coords, inflow);
-            return;
-        }
-        if coords.x >= dims.x - 2 {
-            let outflow = textureLoad(vel_in, vec2<i32>(dims.x - 3, coords.y), 0);
-            textureStore(vel_out, coords, outflow);
-            return;
-        }
+    // In RiverRocks mode (`scenario_mode == 1`), preserve fixed left inlet velocity (`coords.x < 4`),
+    // while allowing full pressure projection right up to the right outlet (`coords.x == dims.x - 1`)
+    // so eddies exit the right edge cleanly without building up un-projected divergence back-pressure!
+    if params.scenario_mode == 1u && coords.x < 4 {
+        let inflow = textureLoad(vel_in, coords, 0);
+        textureStore(vel_out, coords, inflow);
+        return;
     }
 
     let c_left   = clamp_coords(coords - vec2<i32>(1, 0), params.sim_size);

@@ -74,11 +74,23 @@ fn splat_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
     var vel = textureLoad(vel_in, coords, 0);
     let uv = texel_to_uv(coords, params.inv_sim_size);
 
-    // Scenario 1 (River with Rocks): Enforce continuous horizontal laminar inflow along the left edge.
-    if params.scenario_mode == 1u && id.x < 10u {
-        // Taper slightly near the top and bottom channel walls so the inflow profile is smooth.
+    // Scenario 1 (River with Rocks):
+    // 1. Enforce continuous horizontal laminar inflow along the left inlet (`id.x < 8u`).
+    // 2. Enforce matched horizontal outflow sink along the right outlet (`id.x >= dims.x - 4u`,
+    //    preserving vertical velocity `vel.y` so vortex streets convect freely off-screen!).
+    // 3. Apply a gentle streamwise pressure-gradient acceleration across the open channel so
+    //    viscous drag from boulders never stalls the downstream half of the river.
+    if params.scenario_mode == 1u {
         let wall_profile = smoothstep(0.02, 0.10, uv.y) * (1.0 - smoothstep(0.90, 0.98, uv.y));
-        vel = vec4<f32>(params.inflow_velocity * wall_profile, 0.0, 0.0, 1.0);
+        let target_u = params.inflow_velocity * wall_profile;
+        if id.x < 8u {
+            vel = vec4<f32>(target_u, 0.0, 0.0, 1.0);
+        } else if id.x >= dims.x - 4u {
+            vel = vec4<f32>(target_u, vel.y, 0.0, 1.0);
+        } else {
+            // Subtle channel slope acceleration keeping the mean river current moving steadily right.
+            vel.x += params.dt * (target_u - vel.x) * 0.45;
+        }
     }
 
     if params.splat_active != 0u && params.obstacle_brush_mode == 0u {
@@ -100,12 +112,6 @@ fn splat_dye(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let coords = vec2<i32>(id.xy);
     let uv = texel_to_uv(coords, params.inv_dye_size);
-    let obs = bilerp(obs_in, uv, params.sim_size);
-    if is_obstacle_solid(obs) {
-        textureStore(dye_out, coords, vec4<f32>(0.0));
-        return;
-    }
-
     var dye = textureLoad(dye_in, coords, 0);
 
     // Scenario 1 (River with Rocks): Inject 7 parallel laminar dye ribbons along the left inlet

@@ -52,6 +52,7 @@ struct CircularRock {
 pub fn apply_scenario(
     scenario: ScenarioMode,
     params: &mut SimParams,
+    velocity: &PingPongTexture,
     obstacles: &PingPongTexture,
     queue: &wgpu::Queue,
 ) -> DisplayMode {
@@ -73,7 +74,7 @@ pub fn apply_scenario(
             // von Kármán vortex street downstream of each boulder.
             params.vorticity_strength = 18.0;
             params.velocity_dissipation = 0.9995;
-            params.dye_dissipation = 0.9992;
+            params.dye_dissipation = 0.9995;
             params.dye_diffusion = 0.008;
             params.inflow_velocity = 135.0;
 
@@ -93,29 +94,42 @@ pub fn apply_scenario(
                     radius: 0.058,
                 },
             ];
-            upload_rocks_mask(obstacles, queue, &rocks);
+            upload_rocks_and_initial_river_velocity(
+                velocity,
+                obstacles,
+                queue,
+                &rocks,
+                params.inflow_velocity,
+            );
             DisplayMode::RawDye
         }
     }
 }
 
-/// Rasterizes circular boulders into an `Rgba32Float` buffer and uploads it to both buffers of `obstacles`.
-///
-/// Texture channel layout:
-/// - `.r`: `1.0` if the texel is inside a solid obstacle, `0.0` if fluid.
-/// - `.gb`: Outward-pointing 2D unit normal `(nx, ny)` for boundary reflection and 3D rock shading.
-/// - `.a`: Normalized dome height `sqrt(1 - (r / R)^2)` in `[0.0, 1.0]` for 3D boulder rendering.
-fn upload_rocks_mask(obstacles: &PingPongTexture, queue: &wgpu::Queue, rocks: &[CircularRock]) {
+/// Rasterizes circular boulders into `obstacles` and initializes `velocity` to a uniform
+/// horizontal freestream flow outside the boulders so the river flows across the entire
+/// channel immediately from Frame 0.
+fn upload_rocks_and_initial_river_velocity(
+    velocity: &PingPongTexture,
+    obstacles: &PingPongTexture,
+    queue: &wgpu::Queue,
+    rocks: &[CircularRock],
+    inflow_velocity: f32,
+) {
     let w = obstacles.width;
     let h = obstacles.height;
     let aspect = w as f32 / h.max(1) as f32;
-    let mut pixels = vec![[0.0f32; 4]; (w * h) as usize];
+    let mut obs_pixels = vec![[0.0f32; 4]; (w * h) as usize];
+    let mut vel_pixels = vec![[0.0f32; 4]; (w * h) as usize];
 
     for y in 0..h {
         let v = (y as f32 + 0.5) / h as f32;
+        let wall_taper = smoothstep(0.02, 0.10, v) * (1.0 - smoothstep(0.90, 0.98, v));
         for x in 0..w {
             let u = (x as f32 + 0.5) / w as f32;
+            let idx = (y * w + x) as usize;
 
+            let mut inside_rock = false;
             for rock in rocks {
                 let dx = (u - rock.center[0]) * aspect;
                 let dy = v - rock.center[1];
@@ -128,14 +142,19 @@ fn upload_rocks_mask(obstacles: &PingPongTexture, queue: &wgpu::Queue, rocks: &[
                         (0.0, 0.0)
                     };
                     let dome_height = (1.0 - norm_r * norm_r).max(0.0).sqrt();
-                    pixels[(y * w + x) as usize] = [1.0, nx, ny, dome_height];
+                    obs_pixels[idx] = [1.0, nx, ny, dome_height];
+                    inside_rock = true;
                     break;
                 }
+            }
+
+            if !inside_rock {
+                vel_pixels[idx] = [inflow_velocity * wall_taper, 0.0, 0.0, 1.0];
             }
         }
     }
 
-    let raw_bytes: &[u8] = bytemuck::cast_slice(&pixels);
+    let obs_bytes: &[u8] = bytemuck::cast_slice(&obs_pixels);
     for tex in [&obstacles.read.texture, &obstacles.write.texture] {
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -144,7 +163,7 @@ fn upload_rocks_mask(obstacles: &PingPongTexture, queue: &wgpu::Queue, rocks: &[
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            raw_bytes,
+            obs_bytes,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(w * 16),
@@ -157,4 +176,32 @@ fn upload_rocks_mask(obstacles: &PingPongTexture, queue: &wgpu::Queue, rocks: &[
             },
         );
     }
+
+    let vel_bytes: &[u8] = bytemuck::cast_slice(&vel_pixels);
+    for tex in [&velocity.read.texture, &velocity.write.texture] {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            vel_bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 16),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }

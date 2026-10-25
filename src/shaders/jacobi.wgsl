@@ -49,9 +49,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    // Solid obstacle cells and the right river outflow boundary maintain zero gauge pressure.
+    // Solid obstacle cells and the right river outflow plane (`x == dims.x - 1`) maintain zero gauge pressure.
     if is_obstacle_solid(textureLoad(obs_in, coords, 0))
-        || (params.scenario_mode == 1u && coords.x >= dims.x - 2)
+        || (params.scenario_mode == 1u && coords.x == dims.x - 1)
     {
         textureStore(pressure_out, coords, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         return;

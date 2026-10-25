@@ -34,7 +34,8 @@ fn sample_vel_no_slip(coords: vec2<i32>, size: vec2<i32>) -> vec2<f32> {
     }
     if coords.x >= size.x {
         if params.scenario_mode == 1u {
-            // Open outflow boundary on the right edge of the river channel.
+            // Convective open outflow boundary on the right edge of the river channel:
+            // extrapolate velocity so $\partial u_x / \partial x = 0$ at the exit plane.
             return textureLoad(vel_in, vec2<i32>(size.x - 1, coords.y), 0).xy;
         }
         return vec2<f32>(0.0);

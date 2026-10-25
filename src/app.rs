@@ -544,6 +544,7 @@ impl AppState {
             self.display_mode = apply_scenario(
                 scen,
                 &mut self.solver.params,
+                &self.solver.velocity,
                 &self.solver.obstacles,
                 &self.gpu.queue,
             );

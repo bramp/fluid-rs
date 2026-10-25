@@ -103,9 +103,13 @@ fn shade_milk_in_coffee(uv: vec2<f32>, dye: vec4<f32>) -> vec3<f32> {
 
 // Shades a 3D wet river boulder using the normal `(obs.y, obs.z)` and dome height `obs.w`
 // stored in `obs_tex`.
+// Divides `.yzw` by `max(obs.x, 1e-3)` so bilinear filtering along the rock silhouette
+// (where `0 < obs.x < 1`) does not darken the normal or dome height into a black halo.
 fn shade_river_rock(obs: vec4<f32>) -> vec3<f32> {
-    let n2d = obs.yz;
-    let nz = max(obs.w, 0.15);
+    let inv_mask = 1.0 / max(obs.x, 1e-3);
+    let n2d = obs.yz * inv_mask;
+    let dome = clamp(obs.w * inv_mask, 0.0, 1.0);
+    let nz = max(dome, 0.25);
     let normal = normalize(vec3<f32>(n2d, nz));
     let light_dir = normalize(vec3<f32>(-0.5, -0.55, 0.67));
     let view_dir = vec3<f32>(0.0, 0.0, 1.0);
@@ -114,10 +118,22 @@ fn shade_river_rock(obs: vec4<f32>) -> vec3<f32> {
     let diff = max(dot(normal, light_dir), 0.0);
     let spec = pow(max(dot(normal, half_vec), 0.0), 28.0);
 
-    let rock_dark = vec3<f32>(0.16, 0.18, 0.21);
-    let rock_lit  = vec3<f32>(0.44, 0.47, 0.51);
-    let rim_moss  = vec3<f32>(0.24, 0.34, 0.30) * (1.0 - obs.w);
-    return mix(rock_dark, rock_lit, diff) + rim_moss * 0.35 + vec3<f32>(0.28, 0.32, 0.35) * spec;
+    let rock_dark = vec3<f32>(0.22, 0.25, 0.29);
+    let rock_lit  = vec3<f32>(0.50, 0.53, 0.57);
+    let rim_moss  = vec3<f32>(0.26, 0.38, 0.34) * (1.0 - dome);
+    return mix(rock_dark, rock_lit, diff) + rim_moss * 0.4 + vec3<f32>(0.30, 0.34, 0.38) * spec;
+}
+
+// Blends the shaded 3D river boulder over the fluid `color` across `[0.35, 0.65]` (while dye is
+// only zeroed deep inside the rock at `obs.x > 0.92`) so the anti-aliased rock edge always
+// composites over valid water/dye color with zero black border.
+fn composite_obstacle(color: vec3<f32>, obs: vec4<f32>, shaded_rock: bool) -> vec3<f32> {
+    if params.enable_obstacles == 0u || obs.x <= 0.30 {
+        return color;
+    }
+    let alpha = smoothstep(0.32, 0.68, obs.x);
+    let rock_col = select(vec3<f32>(0.22, 0.24, 0.28), shade_river_rock(obs), shaded_rock);
+    return mix(color, rock_col, alpha);
 }
 
 @fragment
@@ -134,56 +150,43 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     switch params.display_mode {
         // 0: Milk in Coffee (Artistic Beer-Lambert color ramp + specular rim lighting)
         case 0u, default: {
-            color = shade_milk_in_coffee(in.uv, dye);
-            if is_obstacle_solid(obs) {
-                color = mix(color, shade_river_rock(obs), smoothstep(0.3, 0.65, obs.x));
-            }
+            color = composite_obstacle(shade_milk_in_coffee(in.uv, dye), obs, true);
         }
         // 1: Velocity debug view (direction angle -> hue, speed -> brightness)
         case 1u: {
             let speed = length(vel);
             let angle = atan2(vel.y, vel.x) / (2.0 * 3.14159265) + 0.5;
             let mag = clamp(speed * 0.004, 0.0, 1.0);
-            color = hsv_to_rgb(angle, 0.85, mag);
-            if is_obstacle_solid(obs) {
-                color = mix(color, vec3<f32>(0.18, 0.18, 0.22), smoothstep(0.3, 0.65, obs.x));
-            }
+            color = composite_obstacle(hsv_to_rgb(angle, 0.85, mag), obs, false);
         }
         // 2: Pressure field heatmap (red = high pressure ahead of stroke/rock, blue = low pressure wake)
         case 2u: {
-            color = signed_heatmap(pressure * 0.015);
-            if is_obstacle_solid(obs) {
-                color = mix(color, vec3<f32>(0.18, 0.18, 0.22), smoothstep(0.3, 0.65, obs.x));
-            }
+            color = composite_obstacle(signed_heatmap(pressure * 0.015), obs, false);
         }
         // 3: Velocity divergence heatmap ($\nabla \cdot \mathbf{u}$)
         case 3u: {
-            color = signed_heatmap(div * 0.08);
-            if is_obstacle_solid(obs) {
-                color = mix(color, vec3<f32>(0.18, 0.18, 0.22), smoothstep(0.3, 0.65, obs.x));
-            }
+            color = composite_obstacle(signed_heatmap(div * 0.08), obs, false);
         }
         // 4: Curl / Vorticity heatmap ($\omega = \nabla \times \mathbf{u}$)
         case 4u: {
-            color = signed_heatmap(curl * 0.06);
-            if is_obstacle_solid(obs) {
-                color = mix(color, vec3<f32>(0.18, 0.18, 0.22), smoothstep(0.3, 0.65, obs.x));
-            }
+            color = composite_obstacle(signed_heatmap(curl * 0.06), obs, false);
         }
         // 5: Raw RGB Dye / River Stream view
         case 5u: {
             let bg = select(vec3<f32>(0.04, 0.035, 0.045), vec3<f32>(0.02, 0.055, 0.085), params.scenario_mode == 1u);
             let mapped_dye = vec3<f32>(1.0) - exp(-dye.rgb * 1.4);
-            color = bg + mapped_dye;
-            if is_obstacle_solid(obs) {
-                color = mix(color, shade_river_rock(obs), smoothstep(0.3, 0.65, obs.x));
-            }
+            color = composite_obstacle(bg + mapped_dye, obs, true);
         }
         // 6: Obstacles debug view (mask & 2D boundary normals)
         case 6u: {
-            if obs.x > 0.1 {
-                let n_col = vec3<f32>(obs.y * 0.5 + 0.5, obs.z * 0.5 + 0.5, obs.w);
-                color = n_col * obs.x;
+            if obs.x > 0.05 {
+                let inv_mask = 1.0 / max(obs.x, 1e-3);
+                let n_col = vec3<f32>(
+                    (obs.y * inv_mask) * 0.5 + 0.5,
+                    (obs.z * inv_mask) * 0.5 + 0.5,
+                    obs.w * inv_mask,
+                );
+                color = n_col * smoothstep(0.05, 0.5, obs.x);
             } else {
                 color = vec3<f32>(0.04, 0.04, 0.06);
             }
