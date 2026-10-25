@@ -56,16 +56,33 @@ fn paint_obstacles(@builtin(global_invocation_id) id: vec3<u32>) {
 
         if dist <= brush_r + aa_width {
             if params.obstacle_brush_mode == 1u {
+                // Mode 1: Draw Solid Wall / Rock
                 let coverage = smoothstep(brush_r + aa_width, brush_r - aa_width, dist);
                 let norm_r = clamp(dist / max(brush_r, 1e-5), 0.0, 1.0);
                 let n = select(vec2<f32>(0.0), seg_vec / dist, dist > 1e-5);
-                // Smooth ridge cross-section ($1 - r^2$) that stays continuous along the spine.
                 let dome = sqrt(max(1.0 - norm_r * norm_r, 0.0));
-                if coverage > obs.x || dome > obs.w {
-                    obs = vec4<f32>(max(obs.x, coverage), n.x, n.y, max(obs.w, dome));
+                if coverage > obs.x || dome > obs.w || obs.y != 0.0 {
+                    obs = vec4<f32>(max(obs.x, coverage), 0.0, n.x, max(obs.w, dome));
                 }
-            } else {
+            } else if params.obstacle_brush_mode == 2u {
+                // Mode 2: Eraser (clears walls, sources, and drains)
                 obs = vec4<f32>(0.0);
+            } else if params.obstacle_brush_mode == 3u && dist <= brush_r {
+                // Mode 3: Draw Liquid Source (Inlet) spraying in the drag direction `(splat_pos - splat_vel)`
+                let drag = params.splat_pos - params.splat_vel;
+                let drag_len = length(drag);
+                var dir = vec2<f32>(1.0, 0.0);
+                if drag_len > 1e-4 {
+                    dir = drag / drag_len;
+                } else if abs(obs.z) + abs(obs.w) > 0.1 {
+                    dir = normalize(obs.zw);
+                } else if params.scenario_mode == 2u {
+                    dir = vec2<f32>(0.0, -1.0);
+                }
+                obs = vec4<f32>(0.0, 1.0, dir.x, dir.y);
+            } else if params.obstacle_brush_mode == 4u && dist <= brush_r {
+                // Mode 4: Draw Liquid Drain (Outlet / Sink)
+                obs = vec4<f32>(0.0, -1.0, 0.0, 0.0);
             }
         }
     }
@@ -91,10 +108,16 @@ fn splat_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
     var vel = textureLoad(vel_in, coords, 0);
     let uv = texel_to_uv(coords, params.inv_sim_size);
 
-    // Note: In `RiverRocks` mode (`scenario_mode == 1`), the river current is driven physically by
-    // the hydrostatic pressure drop between $p(0) = P_{\text{head}}$ and $p(W-1) = 0$ in `jacobi.wgsl`
-    // and `project.wgsl` rather than hard-overwriting `vel` here. That way, if the user builds a dam
-    // across the river, back-pressure builds up and naturally stops new flow from entering!
+    // Painted Liquid Sources (`is_source_cell(obs)`): accelerate fluid in the source's spray direction `obs.zw`.
+    // Note that in `RiverRocks` mode, the left inlet is also backed by the hydrostatic pressure head
+    // in `jacobi.wgsl`, so if the user builds a full dam across the river, back-pressure in `project.wgsl`
+    // opposes and stops the inflow!
+    if is_source_cell(obs) && params.scenario_mode != 1u {
+        let spray_dir = obs.zw;
+        let target_vel = spray_dir * max(params.inflow_velocity, 90.0);
+        vel = vec4<f32>(mix(vel.xy, target_vel, 0.15), 0.0, 1.0);
+    }
+
     if params.splat_active != 0u && params.obstacle_brush_mode == 0u {
         let aspect = params.sim_size.x * params.inv_sim_size.y;
         let weight = gaussian_splat(uv, params.splat_pos, params.splat_radius, aspect);
@@ -115,33 +138,48 @@ fn splat_dye(@builtin(global_invocation_id) id: vec3<u32>) {
     let coords = vec2<i32>(id.xy);
     let uv = texel_to_uv(coords, params.inv_dye_size);
     var dye = textureLoad(dye_in, coords, 0);
+    let obs_here = bilerp(obs_in, uv, params.sim_size);
 
-    // Scenario 1 (River with Rocks): Inject 7 parallel laminar dye ribbons along the left inlet,
-    // gated by the actual forward inflow velocity `local_vel.x` so if a dam blocks the river and
-    // back-pressure stops the inlet flow, new dye stops entering too!
-    if params.scenario_mode == 1u && uv.x < 0.018 {
-        let local_u = bilerp(vel_in, uv, params.sim_size).x;
-        let flow_gate = clamp(local_u / max(params.inflow_velocity * 0.5, 1.0), 0.0, 1.0);
+    // Painted Drain Cells (`is_drain_cell(obs_here)`): absorb arriving dye so fluid visibly exits into the drain!
+    if is_drain_cell(obs_here) {
+        dye *= 0.65;
+    }
 
-        if flow_gate > 0.01 {
-            let band_coord = uv.y * 9.0;
-            let band_idx = i32(floor(band_coord));
-            let band_frac = fract(band_coord);
-            // Smooth ribbon profile inside each band (leaving dark water gaps between bands).
-            let profile = smoothstep(0.18, 0.32, band_frac) * (1.0 - smoothstep(0.68, 0.82, band_frac));
+    // Painted Source Cells (`is_source_cell(obs_here)`): inject dye/milk/bubbles into the flow,
+    // gated by forward velocity so a dammed source stops feeding new dye!
+    if is_source_cell(obs_here) {
+        let local_vel = bilerp(vel_in, uv, params.sim_size).xy;
+        let spray_dir = select(vec2<f32>(1.0, 0.0), normalize(obs_here.zw), length(obs_here.zw) > 0.1);
+        let forward_speed = dot(local_vel, spray_dir);
+        let flow_gate = clamp(forward_speed / max(params.inflow_velocity * 0.4, 15.0), 0.0, 1.0);
 
-            var target_dye = vec4<f32>(0.0);
-            if band_idx >= 1 && band_idx <= 7 {
-                var stream_col = vec3<f32>(0.15, 0.78, 0.92);
-                if (band_idx & 1) == 0 {
-                    stream_col = vec3<f32>(0.96, 0.62, 0.22);
+        if params.scenario_mode == 1u && uv.x < 0.03 {
+            // River with Rocks preset inlet: 7 contrasting streamline ribbons
+            if flow_gate > 0.01 {
+                let band_coord = uv.y * 9.0;
+                let band_idx = i32(floor(band_coord));
+                let band_frac = fract(band_coord);
+                let profile = smoothstep(0.18, 0.32, band_frac) * (1.0 - smoothstep(0.68, 0.82, band_frac));
+
+                var target_dye = vec4<f32>(0.0);
+                if band_idx >= 1 && band_idx <= 7 {
+                    var stream_col = vec3<f32>(0.15, 0.78, 0.92);
+                    if (band_idx & 1) == 0 {
+                        stream_col = vec3<f32>(0.96, 0.62, 0.22);
+                    }
+                    if band_idx == 4 {
+                        stream_col = vec3<f32>(0.25, 0.92, 0.62);
+                    }
+                    target_dye = vec4<f32>(stream_col * profile * 1.15, 1.0);
                 }
-                if band_idx == 4 {
-                    stream_col = vec3<f32>(0.25, 0.92, 0.62);
-                }
-                target_dye = vec4<f32>(stream_col * profile * 1.15, 1.0);
+                dye = mix(dye, target_dye, flow_gate * 0.35);
             }
-            dye = mix(dye, target_dye, flow_gate * 0.35);
+        } else if params.scenario_mode == 2u {
+            // Guinness mode source: emits nitrogen micro-bubbles (`.a`)
+            dye.a = mix(dye.a, 1.0, 0.25);
+        } else {
+            // Custom user-painted source (or Milk in Coffee spout): emits `params.splat_color`
+            dye = mix(dye, params.splat_color, max(flow_gate, 0.25) * 0.30);
         }
     }
 

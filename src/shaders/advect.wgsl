@@ -53,7 +53,7 @@ fn clamp_to_local_extrema(tex: texture_2d<f32>, uv: vec2<f32>, size: vec2<f32>, 
 }
 
 // Pushes any UV coordinate that touches or enters a solid obstacle (`obs.x > 0.05`) outward
-// along the obstacle's 2D surface normal `obs.yz` into the pure fluid region (`obs.x == 0`).
+// along the negative gradient $-\nabla(\text{obs.x})$ into the pure fluid region (`obs.x == 0`).
 // This guarantees that `bilerp`, `clamp_to_local_extrema`, and rock-rim pixels NEVER sample
 // dark/uninitialized texels from inside an obstacle!
 fn push_uv_outside_obstacle(uv: vec2<f32>) -> vec2<f32> {
@@ -64,11 +64,17 @@ fn push_uv_outside_obstacle(uv: vec2<f32>) -> vec2<f32> {
     if obs.x <= 0.05 {
         return uv;
     }
-    let n_len = length(obs.yz);
+    let dx = vec2<f32>(params.inv_sim_size.x * 1.5, 0.0);
+    let dy = vec2<f32>(0.0, params.inv_sim_size.y * 1.5);
+    let grad_obs = vec2<f32>(
+        bilerp(obs_in, uv + dx, params.sim_size).x - bilerp(obs_in, uv - dx, params.sim_size).x,
+        bilerp(obs_in, uv + dy, params.sim_size).x - bilerp(obs_in, uv - dy, params.sim_size).x,
+    );
+    let n_len = length(grad_obs);
     if n_len > 1e-4 {
-        let n = obs.yz / n_len;
+        let outward_n = -grad_obs / n_len;
         // Step 2.2 simulation texels outward along the rock's surface normal into open water.
-        return clamp(uv + n * params.inv_sim_size * 2.2, vec2<f32>(0.0), vec2<f32>(1.0));
+        return clamp(uv + outward_n * params.inv_sim_size * 2.2, vec2<f32>(0.0), vec2<f32>(1.0));
     }
     return uv;
 }

@@ -879,12 +879,9 @@ impl FluidSolver {
             self.obstacles.swap();
         }
 
-        // Pass 1b: Splat / Inflow / Bubble Nucleation injection.
-        // Runs whenever the user drags the fluid brush OR continuously in `RiverRocks` (`scenario_mode == 1`)
-        // and `Guinness` (`scenario_mode == 2`) modes.
-        if (self.params.splat_active != 0 && self.params.obstacle_brush_mode == 0)
-            || self.params.scenario_mode == 1
-            || self.params.scenario_mode == 2
+        // Pass 1b: Splat / Source Inflow / Drain Absorption / Foam Accretion pass.
+        // Runs every frame so user-painted Sources (`obs.y > 0`) and Drains (`obs.y < 0`)
+        // remain active in all presets alongside mouse pouring.
         {
             let splat_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("splat_bg"),

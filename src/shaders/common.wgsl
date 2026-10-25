@@ -37,6 +37,16 @@ fn is_obstacle_solid(obs: vec4<f32>) -> bool {
     return params.enable_obstacles != 0u && obs.x > 0.5;
 }
 
+// Returns `true` if `obs` texel represents an active liquid/dye source (inlet).
+fn is_source_cell(obs: vec4<f32>) -> bool {
+    return obs.x < 0.25 && obs.y > 0.25;
+}
+
+// Returns `true` if `obs` texel represents a liquid/dye drain (outlet sink).
+fn is_drain_cell(obs: vec4<f32>) -> bool {
+    return obs.x < 0.25 && obs.y < -0.25;
+}
+
 // Converts integer texel coordinates `(i, j)` to normalized cell-center UV coordinates in `[0.0, 1.0]`.
 // Adding `0.5` samples the exact geometric center of the grid cell rather than its top-left corner.
 fn texel_to_uv(coords: vec2<i32>, inv_size: vec2<f32>) -> vec2<f32> {
@@ -50,15 +60,14 @@ fn clamp_coords(coords: vec2<i32>, size: vec2<f32>) -> vec2<i32> {
 
 // Performs bilinear interpolation of `tex` at normalized `uv` in `[0.0, 1.0]` using `textureLoad`.
 //
-// When `params.use_f32_bilerp != 0u`, interpolation weights `frac` are computed in full 32-bit float (`f32`).
-// When `params.use_f32_bilerp == 0u`, `frac` is quantized to 8-bit fixed-point (`1/256` steps) to
-// demonstrate how GPU hardware texture sampler quantization creates stair-stepping at low speeds.
+// Bit 0 of `params.use_f32_bilerp` (`& 1u`) toggles full 32-bit float (`f32`) interpolation vs.
+// 8-bit fixed-point (`1/256` steps) sub-texel quantization.
 fn bilerp(tex: texture_2d<f32>, uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
     // Map normalized UV [0, 1] to continuous texel-center coordinates where texel (i, j) is at (i, j).
     let pos = clamp(uv * size - 0.5, vec2<f32>(0.0), size - 1.0001);
     let base = vec2<i32>(floor(pos));
     var frac = pos - vec2<f32>(base);
-    if params.use_f32_bilerp == 0u {
+    if (params.use_f32_bilerp & 1u) == 0u {
         frac = floor(frac * 256.0) / 256.0;
     }
 

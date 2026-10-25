@@ -6,7 +6,8 @@
 use crate::ping_pong::PingPongTexture;
 use crate::uniforms::{DisplayMode, SimParams};
 
-/// Available simulation presets matching the visual targets in `DESIGN.md`.
+/// Available simulation presets matching the visual targets in `DESIGN.md`, plus a blank
+/// sandbox mode for building custom scenes with walls, sources, and drains.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ScenarioMode {
@@ -16,18 +17,44 @@ pub enum ScenarioMode {
     RiverRocks = 1,
     /// Two-phase Boussinesq buoyancy inside a slanted pint glass (the Boycott effect).
     Guinness = 2,
+    /// Blank canvas for drawing custom walls, liquid sources (inlets), and drains (outlets).
+    Sandbox = 3,
 }
 
 impl ScenarioMode {
     /// All scenario presets currently available in the UI dropdown.
-    pub const ALL: [Self; 3] = [Self::MilkCoffee, Self::RiverRocks, Self::Guinness];
+    pub const ALL: [Self; 4] = [
+        Self::MilkCoffee,
+        Self::RiverRocks,
+        Self::Guinness,
+        Self::Sandbox,
+    ];
 
     /// Human-readable label for the `egui` scenario selector.
     pub fn label(self) -> &'static str {
         match self {
-            Self::MilkCoffee => "1. Milk in Coffee",
-            Self::RiverRocks => "2. River with Rocks (Vortex Street)",
-            Self::Guinness => "3. The Guinness Pour (Boycott Cascade)",
+            Self::MilkCoffee => "☕ 1. Milk in Coffee",
+            Self::RiverRocks => "🪨 2. River with Rocks",
+            Self::Guinness => "🍺 3. The Guinness Pour",
+            Self::Sandbox => "🛠️ 4. Custom Sandbox (Build Your Own)",
+        }
+    }
+
+    /// Short description shown right below the preset selector in the UI.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::MilkCoffee => {
+                "Drag on the cup to pour & swirl steamed milk into dark espresso, or draw a continuous milk spout with the Source tool."
+            }
+            Self::RiverRocks => {
+                "Water flows from the Left Source (green chevrons) past 3 boulders to the Right Drain (amber grate). Draw new rocks, dams, or extra sources!"
+            }
+            Self::Guinness => {
+                "Nitrogen micro-bubbles rise away from the outward-sloping pint glass walls, triggering a downward wall cascade while the creamy head grows downward."
+            }
+            Self::Sandbox => {
+                "Blank canvas: use 'Draw Wall', 'Draw Liquid Source', and 'Draw Drain' to build your own channels, fountains, or vortex chambers!"
+            }
         }
     }
 
@@ -38,10 +65,13 @@ impl ScenarioMode {
                 "Simulates pouring steamed milk into dark espresso: high-res MacCormack advection, vorticity confinement, mass-conserving Fickian diffusion, gentle thermal mug convection, and Beer-Lambert caramel/cream absorption."
             }
             Self::RiverRocks => {
-                "Drives a river channel via a hydrostatic pressure drop past solid boulders. Boundary layer separation behind each rock sheds alternating eddies (a von Kármán vortex street)."
+                "Drives a river channel from a Left Inlet Source to a Right Outlet Drain past solid boulders. Boundary layer separation behind each rock sheds alternating eddies (a von Kármán vortex street)."
             }
             Self::Guinness => {
                 "Coupled two-phase Boussinesq buoyancy inside a slanted tulip pint glass. Rising nitrogen micro-bubbles create a bubble-depleted dense layer along the outward-sloping walls that cascades downward while the core surges upward (the Boycott effect)."
+            }
+            Self::Sandbox => {
+                "Starts with an empty tank so you can draw custom solid boundaries, directional liquid inlets, and outlets anywhere on the screen."
             }
         }
     }
@@ -136,6 +166,18 @@ pub fn apply_scenario(
             upload_guinness_pint_glass_and_initial_state(velocity, dye, obstacles, queue);
             DisplayMode::Guinness
         }
+        ScenarioMode::Sandbox => {
+            params.vorticity_strength = 18.0;
+            params.velocity_dissipation = 0.996;
+            params.dye_dissipation = 0.9995;
+            params.dye_diffusion = 0.010;
+            params.inflow_velocity = 135.0;
+            params.buoyancy_alpha = 0.0;
+            params.buoyancy_beta = 0.0;
+            params.ambient_density = 0.0;
+            obstacles.clear(queue, 16);
+            DisplayMode::RawDye
+        }
     }
 }
 
@@ -173,19 +215,25 @@ fn upload_rocks_and_initial_river_state(
                 if dist <= rock.radius + aa_width {
                     let coverage = smoothstep(rock.radius + aa_width, rock.radius - aa_width, dist);
                     let norm_r = (dist / rock.radius.max(1e-5)).clamp(0.0, 1.0);
-                    let (nx, ny) = if dist > 1e-5 {
-                        (dx / dist, dy / dist)
-                    } else {
-                        (0.0, 0.0)
-                    };
                     let dome_height = (1.0 - norm_r * norm_r).max(0.0).sqrt();
-                    obs_pixels[idx] = [coverage, nx, ny, dome_height];
+                    // `obs.y = 0.0` for solid rocks (`obs.y > 0` is reserved for Sources, `< 0` for Drains).
+                    obs_pixels[idx] = [coverage, 0.0, 0.0, dome_height];
                     inside_rock = coverage > 0.5;
                     break;
                 }
             }
 
             if !inside_rock {
+                // Encode the river's Left Inlet Source (`x < 10`: `obs.y = 1.0`, direction `(1, 0)`)
+                // and Right Outlet Drain (`x >= w - 8`: `obs.y = -1.0`) directly into `obstacles`!
+                // This makes the river's inlet and outlet visible on-screen AND editable with the
+                // Source, Drain, and Eraser mouse tools!
+                if x < 10 && v > 0.06 && v < 0.94 {
+                    obs_pixels[idx] = [0.0, 1.0, 1.0, 0.0];
+                } else if x >= w.saturating_sub(8) && v > 0.06 && v < 0.94 {
+                    obs_pixels[idx] = [0.0, -1.0, 0.0, 0.0];
+                }
+
                 vel_pixels[idx] = [inflow_velocity * wall_taper, 0.0, 0.0, 1.0];
                 let p_linear = p_head * (1.0 - (x as f32 / (w.saturating_sub(1).max(1) as f32)));
                 p_pixels[idx] = [p_linear, 0.0, 0.0, 1.0];
@@ -268,11 +316,8 @@ fn upload_guinness_pint_glass_and_initial_state(
 
             if signed_outside > -aa {
                 let coverage = smoothstep(-aa, aa, signed_outside);
-                // Normal pointing inward into the liquid cavity.
-                let nx = if dx >= 0.0 { -0.98 } else { 0.98 };
-                let ny = -0.18;
                 let dome = (1.0 - (signed_outside / 0.04).clamp(0.0, 1.0)).max(0.2);
-                obs_pixels[idx] = [coverage, nx, ny, dome];
+                obs_pixels[idx] = [coverage, 0.0, 0.0, dome];
             } else {
                 // Start from rest (`vel = 0`): the Boycott circulation and downward wall cascade
                 // emerge 100% naturally from upward bubble slip away from the outward-sloping

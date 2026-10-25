@@ -27,7 +27,7 @@ const SIM_RES: u32 = 512;
 const DYE_RES: u32 = 1024;
 
 /// Width in logical points of the docked `egui` control sidebar.
-const SIDE_PANEL_WIDTH: f32 = 280.0;
+const SIDE_PANEL_WIDTH: f32 = 300.0;
 
 /// Holds the initialized GPU context, fluid solver, `egui` renderer, and interactive UI/mouse state.
 pub struct AppState {
@@ -37,17 +37,19 @@ pub struct AppState {
     pub egui_state: egui_winit::State,
     pub egui_renderer: egui_wgpu::Renderer,
 
-    /// Currently selected scenario preset (`MilkCoffee`, `RiverRocks`).
+    /// Currently selected scenario preset (`MilkCoffee`, `RiverRocks`, `Guinness`, `Sandbox`).
     pub scenario_mode: ScenarioMode,
     /// Currently selected visualization mode in the UI.
     pub display_mode: DisplayMode,
-    /// Currently selected left-mouse brush tool (`FluidAndDye`, `PaintObstacle`, `EraseObstacle`).
+    /// Currently selected left-mouse brush tool (`FluidAndDye`, `PaintObstacle`, `PaintSource`, `PaintDrain`, `EraseObstacle`).
     pub brush_tool: BrushTool,
-    /// Whether the simulation is currently paused (only advances when clicking "Step 1 Frame").
+    /// Whether the simulation is currently paused (only advances when clicking "Step").
     pub paused: bool,
     /// Toggles 32-bit float software bilinear interpolation vs. 8-bit GPU hardware sampler in `advect.wgsl`.
     pub use_f32_bilerp: bool,
-    /// RGB color injected when dragging the mouse.
+    /// Toggles on-screen visual overlays for Liquid Sources (green chevrons), Drains (amber grates), and the brush reticle.
+    pub show_boundary_markers: bool,
+    /// RGB color injected when dragging the mouse or emitted by custom sources.
     pub splat_color: [f32; 3],
     /// Brush radius in normalized UV space `[0.005, 0.08]`.
     pub splat_radius: f32,
@@ -114,6 +116,7 @@ impl AppState {
             brush_tool: BrushTool::FluidAndDye,
             paused: false,
             use_f32_bilerp: true,
+            show_boundary_markers: true,
             splat_color: [0.95, 0.72, 0.38],
             splat_radius: 0.025,
             splat_force: 15.0,
@@ -231,6 +234,9 @@ impl AppState {
                     } else {
                         self.solver.params.splat_active = 0;
                     }
+                } else if let Some(uv) = self.cursor_to_canvas_uv(position) {
+                    // Track hover position so the on-canvas brush reticle follows the cursor!
+                    self.solver.params.splat_pos = [uv.x, uv.y];
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -279,13 +285,18 @@ impl AppState {
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.heading("fluid-rs");
-                        ui.label("2D Eulerian Fluid Simulator");
+                        ui.small("Interactive 2D Eulerian Fluid Simulator");
                         ui.separator();
 
-                        ui.label("Scenario Preset")
-                            .on_hover_text("Load a complete physical scenario with initial obstacles and boundary conditions.");
+                        // ====================================================
+                        // 1. Scene Preset & View Layer
+                        // ====================================================
+                        ui.label(egui::RichText::new("1. Scene Preset & View").strong())
+                            .on_hover_text("Select a preset scenario or start from a blank sandbox.");
+
                         let prev_scenario = self.scenario_mode;
                         egui::ComboBox::from_id_salt("scenario_mode_combo")
+                            .width(SIDE_PANEL_WIDTH - 28.0)
                             .selected_text(self.scenario_mode.label())
                             .show_ui(ui, |ui| {
                                 for scen in ScenarioMode::ALL {
@@ -299,9 +310,45 @@ impl AppState {
                             requested_scenario = Some(self.scenario_mode);
                         }
 
-                        ui.label("Display Mode")
-                            .on_hover_text("Choose which GPU texture field to visualize on the canvas.");
+                        ui.small(self.scenario_mode.summary());
+
+                        ui.horizontal(|ui| {
+                            let reset_label = match self.scenario_mode {
+                                ScenarioMode::Guinness => "🍺 Re-Pour Fresh Pint",
+                                _ => "🔄 Reset Preset",
+                            };
+                            if ui
+                                .button(reset_label)
+                                .on_hover_text(
+                                    "Restore this preset's initial fluid, dye/bubbles, and boundary layout.",
+                                )
+                                .clicked()
+                            {
+                                requested_scenario = Some(self.scenario_mode);
+                            }
+                            let pause_label = if self.paused { "▶ Resume" } else { "⏸ Pause" };
+                            if ui
+                                .button(pause_label)
+                                .on_hover_text("Pause or resume the simulation loop.")
+                                .clicked()
+                            {
+                                self.paused = !self.paused;
+                            }
+                            if self.paused
+                                && ui
+                                    .button("⏭ Step")
+                                    .on_hover_text("Advance by exactly one frame while paused.")
+                                    .clicked()
+                            {
+                                step_once_requested = true;
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        ui.label("View Layer")
+                            .on_hover_text("Switch between artistic rendering and live physical debug heatmaps.");
                         egui::ComboBox::from_id_salt("display_mode_combo")
+                            .width(SIDE_PANEL_WIDTH - 28.0)
                             .selected_text(self.display_mode.label())
                             .show_ui(ui, |ui| {
                                 for mode in DisplayMode::ALL {
@@ -312,281 +359,429 @@ impl AppState {
                             .response
                             .on_hover_text(self.display_mode.tooltip());
 
+                        ui.checkbox(
+                            &mut self.show_boundary_markers,
+                            "Show Source, Drain & Brush Markers",
+                        )
+                        .on_hover_text(
+                            "Highlights Liquid Sources (green directional chevrons), Drains (amber grates), and your active brush circle on the canvas.",
+                        );
+
+                        // ====================================================
+                        // 2. Canvas Drawing & Pouring Tools
+                        // ====================================================
                         ui.separator();
-                        ui.label("Pipeline Stages & Algorithms")
+                        ui.label(egui::RichText::new("2. Canvas Tool (Draw on Screen)").strong())
                             .on_hover_text(
-                                "Enable or disable individual operator-splitting passes to see how each mathematical term shapes the fluid.",
+                                "You can build or modify any scene by drawing walls, directional liquid sources, and drains directly on the canvas!",
                             );
 
-                        ui.checkbox(
-                            &mut self.solver.enable_vorticity_confinement,
-                            "1. Vorticity Confinement",
-                        )
-                        .on_hover_text(
-                            "Computes curl ω = ∇ × u and injects a tangential booster force f_vort = ε(N × ω) to restore fine turbulent swirls lost to grid dissipation.",
-                        );
-
-                        ui.checkbox(
-                            &mut self.solver.enable_velocity_advection,
-                            "2. Velocity Self-Advection",
-                        )
-                        .on_hover_text(
-                            "Solves ∂u/∂t + (u · ∇)u = 0 so momentum carries itself across the grid. If disabled, velocity stays frozen at the spot where you clicked.",
-                        );
-
-                        ui.checkbox(
-                            &mut self.solver.enable_pressure_projection,
-                            "3. Pressure Projection (∇·u = 0)",
-                        )
-                        .on_hover_text(
-                            "Solves the Poisson equation ∇²p = ∇·u* and subtracts ∇p to make the fluid incompressible. Disable this to see Milestone 2's compressible Burgers shockwaves!",
-                        );
-
-                        ui.checkbox(
-                            &mut self.solver.enable_dye_advection,
-                            "4. High-Res Dye Advection",
-                        )
-                        .on_hover_text(
-                            "Transports the high-resolution dye pigment along the 512×512 velocity field. If disabled, you can paint dye and move velocity, but the dye won't flow.",
-                        );
-
-                        ui.checkbox(
-                            &mut self.solver.enable_obstacles,
-                            "5. Solid Obstacles (No-Slip / Neumann)",
-                        )
-                        .on_hover_text(
-                            "Enforces u = 0 inside solid obstacles and ∂p/∂n = 0 pressure mirroring on obstacle walls. Uncheck in 'River with Rocks' to watch water pass ghost-like through boulders!",
-                        );
-
-                        ui.checkbox(
-                            &mut self.solver.enable_buoyancy,
-                            "6. Boussinesq Buoyancy & Convection",
-                        )
-                        .on_hover_text(
-                            "Applies gravitational sinking (α), upward thermal/bubble lift (β), and thermal mug convection (or the Boycott effect in Guinness mode).",
-                        );
-
-                        ui.checkbox(
-                            &mut self.solver.enable_maccormack_advection,
-                            "MacCormack Advection (2nd-Order)",
-                        )
-                        .on_hover_text(
-                            "Traces forward and backward in time (φ_new = φ_hat + 0.5*(φ - φ_back)) and clamps to the 4 nearest source texels. Uncheck to revert to 1st-order Semi-Lagrangian and watch fine cream ribbons blur faster!",
-                        );
-
-                        ui.checkbox(&mut self.use_f32_bilerp, "f32 Software Bilerp")
-                            .on_hover_text(
-                                "Interpolates advection lookbacks in full 32-bit float via textureLoad instead of 8-bit fixed-point (1/256 texel) weights. Uncheck to observe sub-texel stair-stepping when fluid slows down.",
-                            );
-
-                        ui.separator();
-                        ui.label("Advection, Vorticity & Diffusion");
-                        ui.add(
-                            egui::Slider::new(&mut self.solver.params.dt, 0.001..=0.05)
-                                .text("Timestep (dt)"),
-                        )
-                        .on_hover_text(
-                            "Simulation timestep Δt in seconds per frame. Larger values make the fluid move faster per frame.",
-                        );
-                        if self.scenario_mode == ScenarioMode::RiverRocks {
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut self.solver.params.inflow_velocity,
-                                    10.0..=260.0,
-                                )
-                                .text("River Inflow Speed"),
-                            )
-                            .on_hover_text(
-                                "Horizontal laminar velocity injected along the left boundary of the river channel (controls the Reynolds number of the vortex street).",
-                            );
-                        }
-                        ui.add_enabled(
-                            self.solver.enable_vorticity_confinement,
-                            egui::Slider::new(&mut self.solver.params.vorticity_strength, 0.0..=50.0)
-                                .text("Vorticity (ε)"),
-                        )
-                        .on_hover_text(
-                            "Vorticity confinement scale ε. Higher values inject stronger rotational forces around vortex cores, creating intricate fractal curls.",
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.solver.params.velocity_dissipation, 0.95..=1.0)
-                                .text("Vel Dissipation"),
-                        )
-                        .on_hover_text(
-                            "Per-frame multiplier on velocity (1.0 = no drag, < 1.0 = exponential damping that gradually brings the fluid to rest).",
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.solver.params.dye_diffusion, 0.0..=0.25)
-                                .text("Milk Diffusion (κ)"),
-                        )
-                        .on_hover_text(
-                            "Mass-conserving Fickian Laplacian diffusion rate (∂m/∂t = κ∇²m). Spreads milk into neighboring coffee cells without losing any total milk mass, gradually turning dark espresso into creamy latte!",
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.solver.params.dye_dissipation, 0.98..=1.0)
-                                .text("Dye Retention"),
-                        )
-                        .on_hover_text(
-                            "Per-frame mass retention multiplier (1.0 = 100% of poured milk stays in the cup and mixes into the coffee; < 1.0 = pigment slowly vanishes back to black).",
-                        );
-
-                        ui.separator();
-                        ui.label("Buoyancy, Gravity & Convection");
-                        ui.add_enabled(
-                            self.solver.enable_buoyancy,
-                            egui::Slider::new(&mut self.solver.params.buoyancy_alpha, 0.0..=3.5)
-                                .text("Gravity / Sinking (α)"),
-                        )
-                        .on_hover_text(
-                            "Downward gravitational pull α: in 'Milk in Coffee', pulls dense poured milk downward; in 'The Guinness Pour', drives the downward Boycott cascade of bubble-depleted stout along the slanted glass walls.",
-                        );
-                        ui.add_enabled(
-                            self.solver.enable_buoyancy,
-                            egui::Slider::new(&mut self.solver.params.buoyancy_beta, 0.0..=4.5)
-                                .text("Thermal / Bubble Lift (β)"),
-                        )
-                        .on_hover_text(
-                            "Upward Boussinesq buoyancy lift β: in 'The Guinness Pour', lifts the nitrogen bubble-rich core upward; in 'Milk in Coffee', lifts warm plumes upward.",
-                        );
-                        if self.scenario_mode != ScenarioMode::Guinness {
-                            ui.add_enabled(
-                                self.solver.enable_buoyancy,
-                                egui::Slider::new(
-                                    &mut self.solver.params.ambient_density,
-                                    0.0..=0.8,
-                                )
-                                .text("Mug Convection"),
-                            )
-                            .on_hover_text(
-                                "Background Rayleigh-Bénard thermal circulation in a hot coffee mug (warm core rising in the center, cooler coffee sinking along the outer mug walls) so milk keeps gently folding and mixing even after you stop stirring!",
-                            );
-                        }
-
-                        ui.separator();
-                        ui.label("Pressure Solver (Incompressibility)");
-                        ui.add_enabled(
-                            self.solver.enable_pressure_projection,
-                            egui::Slider::new(&mut self.solver.jacobi_iterations, 0..=80)
-                                .text("Jacobi Iterations"),
-                        )
-                        .on_hover_text(
-                            "Number of parallel Jacobi relaxation passes per frame to solve ∇²p = ∇·u*. ~35 iterations removes nearly all compressibility; drag down to 1–5 to see long-range pressure waves fail to propagate.",
-                        );
-                        ui.add_enabled(
-                            self.solver.enable_pressure_projection,
-                            egui::Checkbox::new(
-                                &mut self.solver.warm_start_pressure,
-                                "Warm-Start Pressure",
-                            ),
-                        )
-                        .on_hover_text(
-                            "Reuses the previous frame's pressure texture as the initial guess for Jacobi iteration instead of clearing to zero. Significantly improves convergence at low iteration counts.",
-                        );
-
-                        ui.separator();
-                        ui.label("Mouse Brush & Obstacles");
-                        egui::ComboBox::from_id_salt("brush_tool_combo")
-                            .selected_text(self.brush_tool.label())
-                            .show_ui(ui, |ui| {
-                                for tool in BrushTool::ALL {
-                                    ui.selectable_value(&mut self.brush_tool, tool, tool.label())
-                                        .on_hover_text(tool.tooltip());
-                                }
-                            })
-                            .response
-                            .on_hover_text(self.brush_tool.tooltip());
-
-                        ui.add(egui::Slider::new(&mut self.splat_radius, 0.005..=0.08).text("Radius"))
-                            .on_hover_text(
-                                "Radius of the fluid splat or solid rock brush in normalized canvas UV units.",
-                            );
-                        ui.add(
-                            egui::Slider::new(&mut self.splat_force, 1.0..=50.0).text("Impulse Force"),
-                        )
-                        .on_hover_text(
-                            "Multiplier converting cursor drag speed into fluid velocity impulse (in simulation grid texels per second).",
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label("Dye Color");
-                            ui.color_edit_button_rgb(&mut self.splat_color)
-                                .on_hover_text("RGB pigment color injected when dragging the mouse.");
-                        });
-
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            let pause_label = if self.paused { "▶ Resume" } else { "⏸ Pause" };
-                            if ui
-                                .button(pause_label)
-                                .on_hover_text("Pause or resume the per-frame simulation loop.")
-                                .clicked()
-                            {
-                                self.paused = !self.paused;
-                            }
-                            if ui
-                                .add_enabled(self.paused, egui::Button::new("⏭ Step"))
-                                .on_hover_text(
-                                    "Advance the fluid solver by exactly one timestep while paused.",
-                                )
-                                .clicked()
-                            {
-                                step_once_requested = true;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            if self.scenario_mode == ScenarioMode::Guinness
-                                && ui
-                                    .button("🍺 Re-Pour Pint")
-                                    .on_hover_text(
-                                        "Pour a fresh pint of Guinness filled with nitrogen micro-bubbles to watch the Boycott cascade and settling cycle from the beginning.",
-                                    )
+                        ui.horizontal_wrapped(|ui| {
+                            for tool in BrushTool::ALL {
+                                if ui
+                                    .selectable_label(self.brush_tool == tool, tool.short_label())
+                                    .on_hover_text(tool.tooltip())
                                     .clicked()
-                            {
-                                requested_scenario = Some(ScenarioMode::Guinness);
+                                {
+                                    self.brush_tool = tool;
+                                }
                             }
-                            if ui
-                                .button("Clear Fluid")
+                        });
+                        ui.small(self.brush_tool.tooltip());
+
+                        ui.add(
+                            egui::Slider::new(&mut self.splat_radius, 0.005..=0.08)
+                                .text("Brush Size"),
+                        )
+                        .on_hover_text("Radius of the active pouring, wall, source, drain, or eraser brush.");
+
+                        match self.brush_tool {
+                            BrushTool::FluidAndDye => {
+                                ui.add(
+                                    egui::Slider::new(&mut self.splat_force, 1.0..=50.0)
+                                        .text("Stirring Force"),
+                                )
                                 .on_hover_text(
-                                    "Reset velocity, dye, pressure, and divergence textures to zero (keeps rocks/glass).",
+                                    "How strongly dragging the mouse pushes the fluid.",
+                                );
+                            }
+                            BrushTool::PaintSource => {
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.solver.params.inflow_velocity,
+                                        15.0..=260.0,
+                                    )
+                                    .text("Source Jet Speed"),
+                                )
+                                .on_hover_text(
+                                    "Outflow speed of painted liquid sources (drag direction when painting sets the spray angle).",
+                                );
+                            }
+                            _ => {}
+                        }
+
+                        if self.display_mode == DisplayMode::RawDye
+                            || self.scenario_mode == ScenarioMode::Sandbox
+                            || self.scenario_mode == ScenarioMode::RiverRocks
+                        {
+                            ui.horizontal(|ui| {
+                                ui.label("Pour / Source Color");
+                                ui.color_edit_button_rgb(&mut self.splat_color)
+                                    .on_hover_text("Pigment color injected by 'Pour & Stir' and custom 'Liquid Sources'.");
+                            });
+                        }
+
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("Clear Liquid")
+                                .on_hover_text(
+                                    "Empty all velocity, dye, and pressure while keeping walls, sources, and drains intact.",
                                 )
                                 .clicked()
                             {
                                 clear_requested = true;
                             }
                             if ui
-                                .button("Clear Rocks")
-                                .on_hover_text("Erase all solid rock obstacles from the canvas.")
+                                .button("Clear All Walls/Sources")
+                                .on_hover_text(
+                                    "Erase all solid rocks, walls, liquid sources, and drains from the canvas.",
+                                )
                                 .clicked()
                             {
                                 clear_obstacles_requested = true;
                             }
                         });
 
+                        // ====================================================
+                        // 3. Context-Sensitive Scene Physics
+                        // ====================================================
                         ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("Dye Grid")
-                                .on_hover_text("Decoupled resolution of the visual dye texture (while physics stays fast at 512×512).");
-                            let current_dye = self.solver.dye.width;
-                            for res in [512u32, 1024, 2048] {
-                                if ui
-                                    .selectable_label(current_dye == res, format!("{res}²"))
-                                    .on_hover_text(format!(
-                                        "Switch dye texture resolution to {res}×{res} while keeping velocity/pressure at 512×512."
-                                    ))
-                                    .clicked()
-                                    && current_dye != res
-                                {
-                                    requested_dye_res = Some(res);
-                                }
+                        match self.scenario_mode {
+                            ScenarioMode::MilkCoffee => {
+                                ui.label(egui::RichText::new("3. Coffee & Milk Physics").strong());
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.solver.params.dye_diffusion,
+                                        0.0..=0.25,
+                                    )
+                                    .text("Milk Blending (Diffusion)"),
+                                )
+                                .on_hover_text(
+                                    "Fickian molecular diffusion rate (κ): spreads milk into neighboring espresso cells while conserving 100% of milk mass.",
+                                );
+                                ui.add_enabled(
+                                    self.solver.enable_buoyancy,
+                                    egui::Slider::new(
+                                        &mut self.solver.params.ambient_density,
+                                        0.0..=0.8,
+                                    )
+                                    .text("Mug Thermal Circulation"),
+                                )
+                                .on_hover_text(
+                                    "Gentle hot-mug convection (warm espresso rising in the center, cooler espresso sinking at the walls) that continues folding milk at rest.",
+                                );
+                                ui.add_enabled(
+                                    self.solver.enable_buoyancy,
+                                    egui::Slider::new(
+                                        &mut self.solver.params.buoyancy_alpha,
+                                        0.0..=3.0,
+                                    )
+                                    .text("Milk Weight (Gravity)"),
+                                )
+                                .on_hover_text(
+                                    "Downward gravitational pull on dense poured milk.",
+                                );
+                                ui.add_enabled(
+                                    self.solver.enable_vorticity_confinement,
+                                    egui::Slider::new(
+                                        &mut self.solver.params.vorticity_strength,
+                                        0.0..=50.0,
+                                    )
+                                    .text("Swirl Crispness (Vorticity)"),
+                                )
+                                .on_hover_text(
+                                    "Amplifies fine rotational eddies so cream ribbons roll up into fractal curls.",
+                                );
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.solver.params.velocity_dissipation,
+                                        0.95..=1.0,
+                                    )
+                                    .text("Momentum Coasting"),
+                                )
+                                .on_hover_text(
+                                    "How long the coffee keeps swirling after you release the mouse (1.0 = no friction).",
+                                );
                             }
+                            ScenarioMode::RiverRocks => {
+                                ui.label(egui::RichText::new("3. River & Vortex Street Physics").strong());
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.solver.params.inflow_velocity,
+                                        10.0..=260.0,
+                                    )
+                                    .text("River Current Speed"),
+                                )
+                                .on_hover_text(
+                                    "Upstream hydrostatic pressure head driving the river from the Left Source (green) to the Right Drain (amber).",
+                                );
+                                ui.add_enabled(
+                                    self.solver.enable_vorticity_confinement,
+                                    egui::Slider::new(
+                                        &mut self.solver.params.vorticity_strength,
+                                        0.0..=50.0,
+                                    )
+                                    .text("Eddy Shedding (Vorticity)"),
+                                )
+                                .on_hover_text(
+                                    "Controls the strength of alternating von Kármán vortices shedding behind boulders.",
+                                );
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.solver.params.dye_diffusion,
+                                        0.0..=0.15,
+                                    )
+                                    .text("Stream Mixing (Diffusion)"),
+                                )
+                                .on_hover_text(
+                                    "How quickly the 7 colored river ribbons blend into each other downstream.",
+                                );
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.solver.params.velocity_dissipation,
+                                        0.95..=1.0,
+                                    )
+                                    .text("Channel Drag (Coasting)"),
+                                )
+                                .on_hover_text(
+                                    "Per-frame momentum retention along the river bed.",
+                                );
+                            }
+                            ScenarioMode::Guinness => {
+                                ui.label(egui::RichText::new("3. Guinness Settling Physics").strong());
+                                ui.add_enabled(
+                                    self.solver.enable_buoyancy,
+                                    egui::Slider::new(
+                                        &mut self.solver.params.buoyancy_beta,
+                                        0.0..=4.5,
+                                    )
+                                    .text("Bubble Buoyancy Lift (β)"),
+                                )
+                                .on_hover_text(
+                                    "Upward Boussinesq lift where bubble density exceeds the horizontal slice mean.",
+                                );
+                                ui.add_enabled(
+                                    self.solver.enable_buoyancy,
+                                    egui::Slider::new(
+                                        &mut self.solver.params.buoyancy_alpha,
+                                        0.0..=3.5,
+                                    )
+                                    .text("Wall Cascade Sink (α)"),
+                                )
+                                .on_hover_text(
+                                    "Downward Boycott gravity-current strength in the bubble-depleted film along the outward-sloping pint glass walls.",
+                                );
+                                ui.add_enabled(
+                                    self.solver.enable_vorticity_confinement,
+                                    egui::Slider::new(
+                                        &mut self.solver.params.vorticity_strength,
+                                        0.0..=40.0,
+                                    )
+                                    .text("Wave Roll Instability (ε)"),
+                                )
+                                .on_hover_text(
+                                    "Vorticity confinement along the shear layer between the descending wall film and rising core.",
+                                );
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.solver.params.velocity_dissipation,
+                                        0.95..=1.0,
+                                    )
+                                    .text("Stout Viscosity Damping"),
+                                )
+                                .on_hover_text(
+                                    "Controls how quickly the stout comes to rest once the bubbles finish rising into the head.",
+                                );
+                            }
+                            ScenarioMode::Sandbox => {
+                                ui.label(egui::RichText::new("3. Sandbox Fluid Physics").strong());
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.solver.params.inflow_velocity,
+                                        10.0..=260.0,
+                                    )
+                                    .text("Source Inflow Speed"),
+                                )
+                                .on_hover_text(
+                                    "Flow speed of any Liquid Sources (green chevrons) you draw on the canvas.",
+                                );
+                                ui.add_enabled(
+                                    self.solver.enable_vorticity_confinement,
+                                    egui::Slider::new(
+                                        &mut self.solver.params.vorticity_strength,
+                                        0.0..=50.0,
+                                    )
+                                    .text("Swirl & Eddies (Vorticity)"),
+                                )
+                                .on_hover_text(
+                                    "Rotational booster force around vortex cores.",
+                                );
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.solver.params.dye_diffusion,
+                                        0.0..=0.25,
+                                    )
+                                    .text("Dye Mixing (Diffusion)"),
+                                )
+                                .on_hover_text("Mass-conserving Laplacian diffusion rate.");
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.solver.params.dye_dissipation,
+                                        0.98..=1.0,
+                                    )
+                                    .text("Dye Retention"),
+                                )
+                                .on_hover_text("1.0 = dye never fades; < 1.0 = dye slowly fades out.");
+                                ui.add_enabled(
+                                    self.solver.enable_buoyancy,
+                                    egui::Slider::new(
+                                        &mut self.solver.params.buoyancy_alpha,
+                                        0.0..=3.5,
+                                    )
+                                    .text("Downward Gravity (α)"),
+                                )
+                                .on_hover_text("Pulls dense dye downward (+Y).");
+                                ui.add_enabled(
+                                    self.solver.enable_buoyancy,
+                                    egui::Slider::new(
+                                        &mut self.solver.params.buoyancy_beta,
+                                        0.0..=4.5,
+                                    )
+                                    .text("Upward Thermal Lift (β)"),
+                                )
+                                .on_hover_text("Lifts buoyant dye upward (-Y).");
+                            }
+                        }
+
+                        // ====================================================
+                        // 4. Collapsible Solver Stages & Advanced CFD
+                        // ====================================================
+                        ui.separator();
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new("4. Solver Stages & Advanced CFD").strong(),
+                        )
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.small(
+                                "Toggle individual Navier-Stokes operator-splitting passes to see how each mathematical term works:",
+                            );
+                            ui.checkbox(
+                                &mut self.solver.enable_vorticity_confinement,
+                                "Vorticity Confinement (Swirl Boost)",
+                            )
+                            .on_hover_text(
+                                "Computes curl ω = ∇ × u and injects a tangential booster force f_vort = ε(N × ω) to restore fine turbulent swirls.",
+                            );
+                            ui.checkbox(
+                                &mut self.solver.enable_velocity_advection,
+                                "Velocity Self-Advection (Momentum)",
+                            )
+                            .on_hover_text(
+                                "Solves ∂u/∂t + (u · ∇)u = 0 so momentum carries itself across the grid.",
+                            );
+                            ui.checkbox(
+                                &mut self.solver.enable_pressure_projection,
+                                "Incompressibility (∇·u = 0 Projection)",
+                            )
+                            .on_hover_text(
+                                "Solves ∇²p = ∇·u* and subtracts ∇p. Uncheck to see Milestone 2's compressible Burgers shockwaves!",
+                            );
+                            ui.checkbox(
+                                &mut self.solver.enable_dye_advection,
+                                "High-Res Dye Transport",
+                            )
+                            .on_hover_text(
+                                "Advects the high-resolution dye/bubble texture along the velocity field.",
+                            );
+                            ui.checkbox(
+                                &mut self.solver.enable_obstacles,
+                                "Solid Walls & Obstacles (No-Slip)",
+                            )
+                            .on_hover_text(
+                                "Enforces u = 0 inside solid walls/rocks and ∂p/∂n = 0 pressure mirroring. Uncheck to let fluid pass ghost-like through walls!",
+                            );
+                            ui.checkbox(
+                                &mut self.solver.enable_buoyancy,
+                                "Buoyancy & Gravity Forces",
+                            )
+                            .on_hover_text(
+                                "Enables Boussinesq gravity, thermal lift, and Boycott convection.",
+                            );
+
+                            ui.separator();
+                            ui.label("Numerical Schemes & Precision");
+                            ui.checkbox(
+                                &mut self.solver.enable_maccormack_advection,
+                                "2nd-Order MacCormack Advection",
+                            )
+                            .on_hover_text(
+                                "Reverses first-order numerical blur via forward-backward error correction clamped to local extrema.",
+                            );
+                            ui.checkbox(&mut self.use_f32_bilerp, "32-Bit Smooth Interpolation")
+                                .on_hover_text(
+                                    "Uncheck to simulate 8-bit hardware texture sampler weight quantization (1/256 texel steps).",
+                                );
+                            ui.add_enabled(
+                                self.solver.enable_pressure_projection,
+                                egui::Checkbox::new(
+                                    &mut self.solver.warm_start_pressure,
+                                    "Warm-Start Pressure Guess",
+                                ),
+                            )
+                            .on_hover_text(
+                                "Reuses the previous frame's pressure solution to accelerate Jacobi convergence.",
+                            );
+                            ui.add_enabled(
+                                self.solver.enable_pressure_projection,
+                                egui::Slider::new(&mut self.solver.jacobi_iterations, 0..=80)
+                                    .text("Pressure Jacobi Steps"),
+                            )
+                            .on_hover_text(
+                                "Number of Poisson relaxation passes per frame (~35 is near-incompressible).",
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut self.solver.params.dt, 0.001..=0.05)
+                                    .text("Timestep (dt)"),
+                            )
+                            .on_hover_text("Simulation timestep Δt in seconds per frame.");
+
+                            ui.horizontal(|ui| {
+                                ui.label("Dye Grid:")
+                                    .on_hover_text("Decoupled resolution of the visual dye texture (physics runs at 512×512).");
+                                let current_dye = self.solver.dye.width;
+                                for res in [512u32, 1024, 2048] {
+                                    if ui
+                                        .selectable_label(current_dye == res, format!("{res}²"))
+                                        .on_hover_text(format!(
+                                            "Switch dye texture resolution to {res}×{res}."
+                                        ))
+                                        .clicked()
+                                        && current_dye != res
+                                    {
+                                        requested_dye_res = Some(res);
+                                    }
+                                }
+                            });
                         });
+
+                        ui.separator();
                         ui.small(format!(
-                            "Sim Grid: {}×{} | Dye Grid: {}×{}",
+                            "Physics Grid: {}×{} | Dye Grid: {}×{}",
                             self.solver.velocity.width,
                             self.solver.velocity.height,
                             self.solver.dye.width,
                             self.solver.dye.height,
                         ));
-                        ui.small("Left-drag: active tool | Right-drag: paint rock");
                     });
                 });
 
@@ -642,7 +837,8 @@ impl AppState {
 
         // Sync UI parameters into SimParams before uploading to the GPU uniform buffer.
         self.solver.params.display_mode = self.display_mode as u32;
-        self.solver.params.use_f32_bilerp = u32::from(self.use_f32_bilerp);
+        self.solver.params.use_f32_bilerp =
+            u32::from(self.use_f32_bilerp) | (u32::from(self.show_boundary_markers) << 1);
         self.solver.params.obstacle_brush_mode = if self.right_mouse_down {
             BrushTool::PaintObstacle as u32
         } else {

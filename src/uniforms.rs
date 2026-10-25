@@ -48,14 +48,14 @@ impl DisplayMode {
     /// Returns a human-readable label for the `egui` combo box.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Dye => "Milk in Coffee (Artistic)",
-            Self::Guinness => "Guinness Pour (Stout & Cascade)",
-            Self::RawDye => "Dye / River Stream (RGB)",
-            Self::Velocity => "Velocity (HSV)",
-            Self::Pressure => "Pressure (Heatmap)",
-            Self::Divergence => "Divergence (Post-Projection)",
-            Self::Curl => "Curl / Vorticity (Heatmap)",
-            Self::Obstacles => "Obstacles (Mask & Normals)",
+            Self::Dye => "Milk in Coffee (Espresso & Cream)",
+            Self::Guinness => "Guinness Stout & Foam Cascade",
+            Self::RawDye => "Color Stream & Boulders",
+            Self::Velocity => "Flow Speed & Direction (Velocity)",
+            Self::Pressure => "Water Pressure (High / Low)",
+            Self::Divergence => "Incompressibility Check (Divergence)",
+            Self::Curl => "Swirl & Eddies (Vorticity)",
+            Self::Obstacles => "Boundaries, Sources & Drains Map",
         }
     }
 
@@ -66,14 +66,16 @@ impl DisplayMode {
                 "Maps scalar milk concentration through a Beer-Lambert exponential absorption curve (espresso → golden caramel → steamed cream) with subtle gradient-based specular rim lighting."
             }
             Self::Guinness => {
-                "Renders a ruby-black Irish stout with golden-tan nitrogen micro-bubble waves, a creamy ivory foam head, and specular pint glass walls."
+                "Renders a ruby-mahogany Irish stout with golden-tan nitrogen micro-bubble waves, a downward-growing creamy ivory foam head, and specular pint glass walls."
             }
-            Self::RawDye => "Renders the RGB dye channels and shaded solid river boulders.",
+            Self::RawDye => {
+                "Renders the RGB dye channels alongside 3D shaded rocks, inflow sources, and outflow drains."
+            }
             Self::Velocity => {
                 "Visualizes the 2D velocity vector field u = (ux, uy): direction angle maps to hue (color wheel) and speed maps to brightness."
             }
             Self::Pressure => {
-                "Visualizes scalar pressure p solved by the Jacobi Poisson pass: warm orange/red = high pressure (stagnation point upstream of rocks), cool blue = low pressure (vortex cores in wake)."
+                "Visualizes scalar pressure p solved by the Jacobi Poisson pass: warm orange/red = high pressure (upstream of dams/rocks), cool blue = low pressure (vortex cores and drains)."
             }
             Self::Divergence => {
                 "Visualizes velocity divergence (∇ · u) after projection. For an incompressible fluid with ~35 Jacobi iterations, this stays nearly black; lower Jacobi iterations to see un-cancelled compression (blue) and expansion (red)."
@@ -82,44 +84,65 @@ impl DisplayMode {
                 "Visualizes 2D scalar vorticity ω = ∂uy/∂x - ∂ux/∂y: warm orange/red = counterclockwise spin, cool blue = clockwise spin. Great for watching von Kármán vortex streets shed behind rocks!"
             }
             Self::Obstacles => {
-                "Visualizes the solid obstacle texture: solid cells are colored by their outward 2D surface normal (red/green = nx/ny, brightness = dome height)."
+                "Visualizes all painted cell types: Solid Walls/Rocks (blue/green surface normals), Liquid Sources (bright emerald), and Liquid Drains (warm coral)."
             }
         }
     }
 }
 
-/// Interactive left-mouse brush mode.
+/// Interactive canvas mouse tool allowing the user to stir/pour fluid or construct any scenario
+/// from scratch by painting walls, directional liquid sources, and drains.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum BrushTool {
-    /// Injects velocity impulses and dye pigment into the fluid.
+    /// Left-dragging stirs the fluid and injects dye, milk, or nitrogen bubbles.
     FluidAndDye = 0,
-    /// Paints solid circular rock obstacles onto the simulation grid.
+    /// Left-dragging paints solid rock boulders, dams, or glass walls.
     PaintObstacle = 1,
-    /// Erases solid obstacles back into open fluid.
+    /// Left-dragging erases walls, sources, and drains back to open fluid.
     EraseObstacle = 2,
+    /// Left-dragging paints a continuous liquid/dye/bubble source spraying in the drag direction.
+    PaintSource = 3,
+    /// Left-dragging paints a liquid drain (sink) where fluid and dye exit the screen.
+    PaintDrain = 4,
 }
 
 impl BrushTool {
-    pub const ALL: [Self; 3] = [Self::FluidAndDye, Self::PaintObstacle, Self::EraseObstacle];
+    pub const ALL: [Self; 5] = [
+        Self::FluidAndDye,
+        Self::PaintObstacle,
+        Self::PaintSource,
+        Self::PaintDrain,
+        Self::EraseObstacle,
+    ];
 
-    pub fn label(self) -> &'static str {
+    pub fn short_label(self) -> &'static str {
         match self {
-            Self::FluidAndDye => "Inject Fluid & Dye",
-            Self::PaintObstacle => "Paint Solid Rock",
-            Self::EraseObstacle => "Erase Solid Rock",
+            Self::FluidAndDye => "🌊 Pour & Stir",
+            Self::PaintObstacle => "🪨 Draw Wall / Rock",
+            Self::PaintSource => "🚰 Draw Source (Inlet)",
+            Self::PaintDrain => "🕳️ Draw Drain (Outlet)",
+            Self::EraseObstacle => "🧽 Eraser",
         }
     }
 
     pub fn tooltip(self) -> &'static str {
         match self {
             Self::FluidAndDye => {
-                "Left-dragging injects Gaussian velocity impulses and dye pigment (Right-drag always paints rocks as a shortcut)."
+                "Left-drag on the canvas to pour dye/milk/bubbles and push the fluid (Right-drag always draws walls/rocks as a quick shortcut)."
             }
             Self::PaintObstacle => {
-                "Left-dragging paints circular solid rock obstacles with 3D surface normals."
+                "Left-drag to draw continuous stone ridges, dams, boulders, or container walls that block fluid flow."
             }
-            Self::EraseObstacle => "Left-dragging erases solid rock obstacles back to open water.",
+            Self::PaintSource => {
+                "Left-drag to place a continuous liquid & dye inlet on the canvas. The direction you drag sets the spray direction of the source!"
+            }
+            Self::PaintDrain => {
+                "Left-drag to place a low-pressure drain (outlet) on the canvas where fluid and dye get sucked in and disappear."
+            }
+            Self::EraseObstacle => {
+                "Left-drag to erase solid walls, rocks, liquid sources, or drains back into open water."
+            }
         }
     }
 }
@@ -225,7 +248,8 @@ impl SimParams {
             splat_radius: 0.025,
             splat_active: 0,
             scenario_mode: 0,
-            use_f32_bilerp: 1,
+            // Bit 0 (1): f32 software bilerp; Bit 1 (2): show on-screen source/drain/cursor markers.
+            use_f32_bilerp: 3,
             dye_diffusion: 0.04,
             inflow_velocity: 135.0,
             obstacle_brush_mode: 0,

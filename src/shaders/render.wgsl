@@ -193,19 +193,80 @@ fn shade_guinness_pour(uv: vec2<f32>, dye: vec4<f32>, obs: vec4<f32>) -> vec3<f3
     return liquid_col;
 }
 
+// Overlays visual indicators for painted Liquid Sources (emerald directional chevrons),
+// Liquid Drains (warm amber/coral sink grates), and the interactive mouse brush reticle
+// when Bit 1 of `params.use_f32_bilerp` (`& 2u`) is enabled.
+fn overlay_boundary_and_cursor_markers(uv: vec2<f32>, base_color: vec3<f32>, obs: vec4<f32>) -> vec3<f32> {
+    if (params.use_f32_bilerp & 2u) == 0u {
+        return base_color;
+    }
+
+    var color = base_color;
+
+    // 1. Liquid Source (Inlet) visual indicator (`obs.y > 0.1`):
+    //    Draws an emerald-cyan emitter zone with directional chevron stripes pointing along `obs.zw`.
+    if obs.x < 0.25 && obs.y > 0.10 {
+        let strength = smoothstep(0.10, 0.65, obs.y);
+        let dir = select(vec2<f32>(1.0, 0.0), normalize(obs.zw), length(obs.zw) > 0.1);
+        let perp = vec2<f32>(-dir.y, dir.x);
+        let along = dot(uv * params.sim_size, dir);
+        let across = abs( fract(dot(uv * params.sim_size, perp) * 0.08) - 0.5 );
+        let chevron = 0.5 + 0.5 * sin((along * 0.45 - across * 4.5));
+        let edge_rim = smoothstep(0.10, 0.45, obs.y) * (1.0 - smoothstep(0.55, 0.92, obs.y));
+        let source_col = vec3<f32>(0.10, 0.92, 0.68) * (0.35 + 0.65 * chevron) + vec3<f32>(0.4, 1.0, 0.85) * edge_rim;
+        color = mix(color, source_col, strength * 0.48);
+    }
+
+    // 2. Liquid Drain (Outlet / Sink) visual indicator (`obs.y < -0.1`):
+    //    Draws a dark sink basin with warm amber/coral diagonal grate bars showing where liquid exits.
+    if obs.x < 0.25 && obs.y < -0.10 {
+        let strength = smoothstep(0.10, 0.65, -obs.y);
+        let p_px = uv * params.sim_size;
+        let grate = 0.5 + 0.5 * sin((p_px.x + p_px.y) * 0.65) * sin((p_px.x - p_px.y) * 0.65);
+        let edge_rim = smoothstep(0.10, 0.45, -obs.y) * (1.0 - smoothstep(0.55, 0.92, -obs.y));
+        let drain_col = mix(vec3<f32>(0.02, 0.01, 0.02), vec3<f32>(0.95, 0.38, 0.20), grate * 0.55 + edge_rim * 0.8);
+        color = mix(color, drain_col, strength * 0.62);
+    }
+
+    // 3. Active Mouse Brush Cursor Reticle around `params.splat_pos`:
+    let aspect = params.sim_size.x * params.inv_sim_size.y;
+    let diff = vec2<f32>((uv.x - params.splat_pos.x) * aspect, uv.y - params.splat_pos.y);
+    let dist = length(diff);
+    let target_r = select(params.splat_radius, params.splat_radius * 1.5, params.obstacle_brush_mode != 0u);
+    let ring_thickness = params.inv_sim_size.y * 1.4;
+    let ring = exp(-pow((dist - target_r) / max(ring_thickness, 1e-4), 2.0));
+
+    if ring > 0.02 {
+        var ring_col = vec3<f32>(0.95, 0.92, 0.85);
+        if params.obstacle_brush_mode == 1u {
+            ring_col = vec3<f32>(0.65, 0.72, 0.80);
+        } else if params.obstacle_brush_mode == 2u {
+            ring_col = vec3<f32>(1.0, 0.30, 0.30);
+        } else if params.obstacle_brush_mode == 3u {
+            ring_col = vec3<f32>(0.15, 0.98, 0.70);
+        } else if params.obstacle_brush_mode == 4u {
+            ring_col = vec3<f32>(0.98, 0.45, 0.20);
+        }
+        color = mix(color, ring_col, ring * 0.65);
+    }
+
+    return color;
+}
 // Blends the shaded 3D river boulder over the fluid `color`.
 // Starts the rock visual silhouette at `obs.x = 0.25` (slightly outside the `obs.x = 0.5` physics
 // boundary) so the smooth rock edge completely covers the underlying `512x512` velocity grid staircase!
 fn composite_obstacle(uv: vec2<f32>, color: vec3<f32>, obs: vec4<f32>, shaded_rock: bool) -> vec3<f32> {
-    if params.enable_obstacles == 0u || obs.x <= 0.15 {
-        return color;
+    var out_col = color;
+    if params.enable_obstacles != 0u && obs.x > 0.15 {
+        if params.scenario_mode == 2u && shaded_rock {
+            out_col = shade_guinness_pour(uv, bilerp(dye_tex, uv, params.dye_size), obs);
+        } else {
+            let alpha = smoothstep(0.18, 0.52, obs.x);
+            let rock_col = select(vec3<f32>(0.22, 0.24, 0.28), shade_river_rock(uv, obs), shaded_rock);
+            out_col = mix(out_col, rock_col, alpha);
+        }
     }
-    if params.scenario_mode == 2u && shaded_rock {
-        return shade_guinness_pour(uv, bilerp(dye_tex, uv, params.dye_size), obs);
-    }
-    let alpha = smoothstep(0.18, 0.52, obs.x);
-    let rock_col = select(vec3<f32>(0.22, 0.24, 0.28), shade_river_rock(uv, obs), shaded_rock);
-    return mix(color, rock_col, alpha);
+    return overlay_boundary_and_cursor_markers(uv, out_col, obs);
 }
 
 @fragment
@@ -253,23 +314,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let mapped_dye = vec3<f32>(1.0) - exp(-dye.rgb * 1.4);
             color = composite_obstacle(in.uv, bg + mapped_dye, obs, true);
         }
-        // 6: Obstacles debug view (mask & 2D boundary normals)
+        // 6: Boundaries, Sources & Drains Map debug view
         case 6u: {
             if obs.x > 0.05 {
-                let inv_mask = 1.0 / max(obs.x, 1e-3);
-                let n_col = vec3<f32>(
-                    (obs.y * inv_mask) * 0.5 + 0.5,
-                    (obs.z * inv_mask) * 0.5 + 0.5,
-                    obs.w * inv_mask,
-                );
+                let step_x = vec2<f32>(params.inv_sim_size.x * 1.5, 0.0);
+                let step_y = vec2<f32>(0.0, params.inv_sim_size.y * 1.5);
+                let gx = bilerp(obs_tex, in.uv + step_x, params.sim_size).w - bilerp(obs_tex, in.uv - step_x, params.sim_size).w;
+                let gy = bilerp(obs_tex, in.uv + step_y, params.sim_size).w - bilerp(obs_tex, in.uv - step_y, params.sim_size).w;
+                let n_col = vec3<f32>(-gx * 1.5 + 0.5, -gy * 1.5 + 0.5, obs.w);
                 color = n_col * smoothstep(0.05, 0.5, obs.x);
+            } else if obs.y > 0.1 {
+                color = vec3<f32>(0.10, 0.88, 0.62) * obs.y;
+            } else if obs.y < -0.1 {
+                color = vec3<f32>(0.92, 0.35, 0.20) * (-obs.y);
             } else {
                 color = vec3<f32>(0.04, 0.04, 0.06);
             }
+            color = overlay_boundary_and_cursor_markers(in.uv, color, obs);
         }
         // 7: Explicit Guinness Stout & Nitrogen Cascade shader
         case 7u: {
-            color = shade_guinness_pour(in.uv, dye, obs);
+            color = overlay_boundary_and_cursor_markers(in.uv, shade_guinness_pour(in.uv, dye, obs), obs);
         }
     }
 
