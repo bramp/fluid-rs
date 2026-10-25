@@ -137,11 +137,13 @@ fn upload_rocks_and_initial_river_state(
             let idx = (y * w + x) as usize;
 
             let mut inside_rock = false;
+            let aa_width = 1.5 / h.max(1) as f32;
             for rock in rocks {
                 let dx = (u - rock.center[0]) * aspect;
                 let dy = v - rock.center[1];
                 let dist = (dx * dx + dy * dy).sqrt();
-                if dist <= rock.radius {
+                if dist <= rock.radius + aa_width {
+                    let coverage = smoothstep(rock.radius + aa_width, rock.radius - aa_width, dist);
                     let norm_r = (dist / rock.radius.max(1e-5)).clamp(0.0, 1.0);
                     let (nx, ny) = if dist > 1e-5 {
                         (dx / dist, dy / dist)
@@ -149,8 +151,8 @@ fn upload_rocks_and_initial_river_state(
                         (0.0, 0.0)
                     };
                     let dome_height = (1.0 - norm_r * norm_r).max(0.0).sqrt();
-                    obs_pixels[idx] = [1.0, nx, ny, dome_height];
-                    inside_rock = true;
+                    obs_pixels[idx] = [coverage, nx, ny, dome_height];
+                    inside_rock = coverage > 0.5;
                     break;
                 }
             }

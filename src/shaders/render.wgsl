@@ -132,13 +132,14 @@ fn shade_river_rock(uv: vec2<f32>, obs: vec4<f32>) -> vec3<f32> {
     return mix(rock_dark, rock_lit, diff) + rim_moss * 0.4 + vec3<f32>(0.30, 0.34, 0.38) * spec;
 }
 
-// Blends the shaded 3D river boulder over the fluid `color` across `[0.32, 0.68]` so the
-// anti-aliased rock edge always composites over valid water/dye color with zero black border.
+// Blends the shaded 3D river boulder over the fluid `color`.
+// Starts the rock visual silhouette at `obs.x = 0.25` (slightly outside the `obs.x = 0.5` physics
+// boundary) so the smooth rock edge completely covers the underlying `512x512` velocity grid staircase!
 fn composite_obstacle(uv: vec2<f32>, color: vec3<f32>, obs: vec4<f32>, shaded_rock: bool) -> vec3<f32> {
-    if params.enable_obstacles == 0u || obs.x <= 0.30 {
+    if params.enable_obstacles == 0u || obs.x <= 0.15 {
         return color;
     }
-    let alpha = smoothstep(0.32, 0.68, obs.x);
+    let alpha = smoothstep(0.18, 0.52, obs.x);
     let rock_col = select(vec3<f32>(0.22, 0.24, 0.28), shade_river_rock(uv, obs), shaded_rock);
     return mix(color, rock_col, alpha);
 }

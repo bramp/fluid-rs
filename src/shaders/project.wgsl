@@ -71,11 +71,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let grad_p = 0.5 * vec2<f32>(p_right - p_left, p_top - p_bottom);
     var vel = textureLoad(vel_in, coords, 0).xy - grad_p;
 
-    // Enforce no-penetration/no-slip on velocity components immediately adjacent to a solid obstacle.
-    if (coords.x > 0 && obs_l) || (coords.x < dims.x - 1 && obs_r) {
+    // Enforce free-slip / no-penetration tangential flow along solid obstacle boundaries.
+    // Instead of zeroing `vel.x` and `vel.y` independently (which locks 45-degree diagonal
+    // staircase notches to `vel = (0, 0)` and traps stagnant black pixels on curved rock faces!),
+    // we compute the outward wall normal `wall_n` from the solid neighbors and only strip the
+    // velocity component pointing into the wall, allowing fluid to slide smoothly along diagonals!
+    let nx = f32(obs_l) - f32(obs_r);
+    let ny = f32(obs_b) - f32(obs_t);
+    let n_len = length(vec2<f32>(nx, ny));
+    if n_len > 0.0 {
+        let wall_n = vec2<f32>(nx, ny) / n_len;
+        let into_wall = min(dot(vel, wall_n), 0.0);
+        vel -= into_wall * wall_n;
+    }
+    // If pinched between two opposite solid walls horizontally or vertically, zero that axis.
+    if obs_l && obs_r {
         vel.x = 0.0;
     }
-    if obs_b || obs_t {
+    if obs_b && obs_t {
         vel.y = 0.0;
     }
 

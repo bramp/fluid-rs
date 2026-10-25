@@ -52,11 +52,34 @@ fn clamp_to_local_extrema(tex: texture_2d<f32>, uv: vec2<f32>, size: vec2<f32>, 
     return clamp(val, min_val, max_val);
 }
 
-// Harmonic extension inside solid obstacles: instead of zeroing dye to black (`0.0`) inside rocks
-// (which causes `bilerp` and anti-aliased rock edges to bleed a dark halo into the water),
-// solid interior texels relax toward the average of their 4 neighbors, naturally enforcing
-// the zero-flux Neumann boundary condition ($\partial c / \partial \mathbf{n} = 0$) across the rock rim!
-fn obstacle_harmonic_dye(tex: texture_2d<f32>, coords: vec2<i32>) -> vec4<f32> {
+// Pushes any UV coordinate that touches or enters a solid obstacle (`obs.x > 0.05`) outward
+// along the obstacle's 2D surface normal `obs.yz` into the pure fluid region (`obs.x == 0`).
+// This guarantees that `bilerp`, `clamp_to_local_extrema`, and rock-rim pixels NEVER sample
+// dark/uninitialized texels from inside an obstacle!
+fn push_uv_outside_obstacle(uv: vec2<f32>) -> vec2<f32> {
+    if params.enable_obstacles == 0u {
+        return uv;
+    }
+    let obs = bilerp(obs_in, uv, params.sim_size);
+    if obs.x <= 0.05 {
+        return uv;
+    }
+    let n_len = length(obs.yz);
+    if n_len > 1e-4 {
+        let n = obs.yz / n_len;
+        // Step 2.2 simulation texels outward along the rock's surface normal into open water.
+        return clamp(uv + n * params.inv_sim_size * 2.2, vec2<f32>(0.0), vec2<f32>(1.0));
+    }
+    return uv;
+}
+
+// Extrapolates adjacent fluid dye into the boundary shell of an obstacle so anti-aliased rock
+// rendering and neighbor lookups never encounter black (`0.0`) interior texels.
+fn obstacle_boundary_dye(tex: texture_2d<f32>, uv: vec2<f32>, coords: vec2<i32>) -> vec4<f32> {
+    let fluid_uv = push_uv_outside_obstacle(uv);
+    if any(fluid_uv != uv) {
+        return bilerp(tex, fluid_uv, params.dye_size);
+    }
     let l = textureLoad(tex, clamp_coords(coords - vec2<i32>(1, 0), params.dye_size), 0);
     let r = textureLoad(tex, clamp_coords(coords + vec2<i32>(1, 0), params.dye_size), 0);
     let b = textureLoad(tex, clamp_coords(coords - vec2<i32>(0, 1), params.dye_size), 0);
@@ -101,12 +124,12 @@ fn advect_dye_predictor(@builtin(global_invocation_id) id: vec3<u32>) {
     let coords = vec2<i32>(id.xy);
     let uv = texel_to_uv(coords, params.inv_dye_size);
     if is_obstacle_solid(bilerp(obs_in, uv, params.sim_size)) {
-        textureStore(field_out, coords, obstacle_harmonic_dye(source_in, coords));
+        textureStore(field_out, coords, obstacle_boundary_dye(source_in, uv, coords));
         return;
     }
 
     let vel = bilerp(vel_in, uv, params.sim_size).xy;
-    let prev_uv = uv - params.dt * vel * params.inv_sim_size;
+    let prev_uv = push_uv_outside_obstacle(uv - params.dt * vel * params.inv_sim_size);
 
     let advected = bilerp(source_in, prev_uv, params.dye_size);
     textureStore(field_out, coords, advected);
@@ -123,22 +146,22 @@ fn advect_dye(@builtin(global_invocation_id) id: vec3<u32>) {
     let coords = vec2<i32>(id.xy);
     let uv = texel_to_uv(coords, params.inv_dye_size);
     if is_obstacle_solid(bilerp(obs_in, uv, params.sim_size)) {
-        textureStore(field_out, coords, obstacle_harmonic_dye(source_in, coords));
+        textureStore(field_out, coords, obstacle_boundary_dye(source_in, uv, coords));
         return;
     }
 
     let vel = bilerp(vel_in, uv, params.sim_size).xy;
-    let prev_uv = uv - params.dt * vel * params.inv_sim_size;
+    let prev_uv = push_uv_outside_obstacle(uv - params.dt * vel * params.inv_sim_size);
 
     let advected = bilerp(source_in, prev_uv, params.dye_size);
 
     let dx = vec2<f32>(params.inv_dye_size.x, 0.0);
     let dy = vec2<f32>(0.0, params.inv_dye_size.y);
     let neighbor_avg = 0.25 * (
-        bilerp(source_in, prev_uv - dx, params.dye_size) +
-        bilerp(source_in, prev_uv + dx, params.dye_size) +
-        bilerp(source_in, prev_uv - dy, params.dye_size) +
-        bilerp(source_in, prev_uv + dy, params.dye_size)
+        bilerp(source_in, push_uv_outside_obstacle(prev_uv - dx), params.dye_size) +
+        bilerp(source_in, push_uv_outside_obstacle(prev_uv + dx), params.dye_size) +
+        bilerp(source_in, push_uv_outside_obstacle(prev_uv - dy), params.dye_size) +
+        bilerp(source_in, push_uv_outside_obstacle(prev_uv + dy), params.dye_size)
     );
     let kappa = clamp(params.dye_diffusion, 0.0, 0.5);
     let diffused = mix(advected, neighbor_avg, kappa) * params.dye_dissipation;
@@ -158,14 +181,14 @@ fn maccormack_dye(@builtin(global_invocation_id) id: vec3<u32>) {
     let coords = vec2<i32>(id.xy);
     let uv = texel_to_uv(coords, params.inv_dye_size);
     if is_obstacle_solid(bilerp(obs_in, uv, params.sim_size)) {
-        textureStore(field_out, coords, obstacle_harmonic_dye(phi_hat_in, coords));
+        textureStore(field_out, coords, obstacle_boundary_dye(phi_hat_in, uv, coords));
         return;
     }
 
     let vel = bilerp(vel_in, uv, params.sim_size).xy;
 
-    let prev_uv = uv - params.dt * vel * params.inv_sim_size;
-    let next_uv = uv + params.dt * vel * params.inv_sim_size;
+    let prev_uv = push_uv_outside_obstacle(uv - params.dt * vel * params.inv_sim_size);
+    let next_uv = push_uv_outside_obstacle(uv + params.dt * vel * params.inv_sim_size);
 
     let phi_n = textureLoad(source_in, coords, 0);
     let phi_hat_n1 = textureLoad(phi_hat_in, coords, 0);
@@ -176,9 +199,12 @@ fn maccormack_dye(@builtin(global_invocation_id) id: vec3<u32>) {
     let clamped = clamp_to_local_extrema(source_in, prev_uv, params.dye_size, corrected);
 
     // Apply mass-conserving 5-point Laplacian diffusion ($\phi + \frac{\kappa}{4}(\sum \phi_{\text{nb}} - 4\phi)$)
-    // on `phi_hat_in`. This damps 1-pixel Nyquist staircase modes, prevents halos around rocks,
-    // and lets milk continuously diffuse into the surrounding coffee while conserving 100% of total milk mass.
-    let neighbor_avg = obstacle_harmonic_dye(phi_hat_in, coords);
+    // on `phi_hat_in`.
+    let l = textureLoad(phi_hat_in, clamp_coords(coords - vec2<i32>(1, 0), params.dye_size), 0);
+    let r = textureLoad(phi_hat_in, clamp_coords(coords + vec2<i32>(1, 0), params.dye_size), 0);
+    let b = textureLoad(phi_hat_in, clamp_coords(coords - vec2<i32>(0, 1), params.dye_size), 0);
+    let t = textureLoad(phi_hat_in, clamp_coords(coords + vec2<i32>(0, 1), params.dye_size), 0);
+    let neighbor_avg = 0.25 * (l + r + b + t);
 
     let kappa = clamp(params.dye_diffusion, 0.0, 0.5);
     let diffused = mix(clamped, neighbor_avg, kappa) * params.dye_dissipation;

@@ -52,15 +52,17 @@ fn paint_obstacles(@builtin(global_invocation_id) id: vec3<u32>) {
         let seg_vec = vector_to_segment(uv, params.splat_vel, params.splat_pos, aspect);
         let dist = length(seg_vec);
         let brush_r = params.splat_radius * 1.5;
+        let aa_width = params.inv_sim_size.y * 1.5;
 
-        if dist <= brush_r {
+        if dist <= brush_r + aa_width {
             if params.obstacle_brush_mode == 1u {
+                let coverage = smoothstep(brush_r + aa_width, brush_r - aa_width, dist);
                 let norm_r = clamp(dist / max(brush_r, 1e-5), 0.0, 1.0);
                 let n = select(vec2<f32>(0.0), seg_vec / dist, dist > 1e-5);
                 // Smooth ridge cross-section ($1 - r^2$) that stays continuous along the spine.
                 let dome = sqrt(max(1.0 - norm_r * norm_r, 0.0));
-                if dome >= obs.w {
-                    obs = vec4<f32>(1.0, n.x, n.y, dome);
+                if coverage > obs.x || dome > obs.w {
+                    obs = vec4<f32>(max(obs.x, coverage), n.x, n.y, max(obs.w, dome));
                 }
             } else {
                 obs = vec4<f32>(0.0);
